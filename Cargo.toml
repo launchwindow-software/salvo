@@ -104,7 +104,7 @@ rcgen = "0.14"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "charset", "http2", "macos-system-configuration"] }
 ring = "0.17"
-rust_decimal = "1"
+rust_decimal = { version = "1", default-features = false }
 rustls = "0.23"
 rustls-pemfile = "2"
 rust-embed = { version = ">= 6, <= 9" }
