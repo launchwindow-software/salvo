@@ -73,12 +73,15 @@ impl TryToTokens for ToParameters {
         ex_generics.params.insert(0, ex_lifetime);
         let ex_impl_generics = ex_generics.split_for_impl().0;
 
+        // Container-level config is spelled `parameters(...)`, but the singular
+        // `parameter(...)` is accepted as an alias so the key matches its
+        // field-level counterpart (see `resolve_field_features`).
         let mut parameters_features = self
             .attrs
             .iter()
             .filter(|attr| attr.path().is_ident("salvo"))
             .filter_map(|attr| {
-                attribute::find_nested_list(attr, "parameters")
+                attribute::find_nested_list_any(attr, &["parameters", "parameter"])
                     .ok()
                     .flatten()
             })
@@ -91,22 +94,6 @@ impl TryToTokens for ToParameters {
             .into_iter()
             .reduce(|acc, item| acc.merge(item));
         let serde_container = serde_util::parse_container(&self.attrs).map_err(Diagnostic::from)?;
-
-        // #[param] is only supported over fields
-        if self.attrs.iter().any(|attr| {
-            attr.path().is_ident("salvo")
-                && attribute::find_nested_list(attr, "parameter")
-                    .ok()
-                    .flatten()
-                    .is_some()
-        }) {
-            return Err(Diagnostic::spanned(
-                ident.span(),
-                DiagLevel::Error,
-                "found `parameter` attribute in unsupported context",
-            )
-            .help("Did you mean `parameters`?"));
-        }
 
         let names = parameters_features.as_mut().and_then(|features| {
             let to_parameters_names = pop_feature!(features => Feature::ToParametersNames(_));
@@ -415,7 +402,10 @@ impl Parameter<'_> {
             .iter()
             .filter_map(|attr| {
                 if attr.path().is_ident("salvo") {
-                    attribute::find_nested_list(attr, "parameter")
+                    // Field-level config is spelled `parameter(...)`; the plural
+                    // `parameters(...)` is accepted as an alias so the key matches
+                    // its container-level counterpart.
+                    attribute::find_nested_list_any(attr, &["parameter", "parameters"])
                         .ok()
                         .flatten()
                         .map(|metas| {
@@ -565,9 +555,15 @@ impl TryToTokens for Parameter<'_> {
         tokens.extend(quote! { #oapi::oapi::parameter::Parameter::new(#name)});
 
         if let Some(parameter_in) = param_features.pop_parameter_in_feature() {
-            tokens.extend(quote! { .parameter_in(#parameter_in) });
+            tokens.extend(quote! { .location(#parameter_in) });
         } else if let Some(parameter_in) = &self.container_attributes.default_parameter_in {
             tokens.extend(parameter_in.try_to_token_stream()?);
+        } else {
+            // `ToParameters` extracts from the query string by default (see `default_source_from`),
+            // so the OpenAPI parameter location must default to `Query` as well. Without this the
+            // location would fall back to `ParameterIn`'s `Path` default, which both mislabels the
+            // parameter and forces `required: true` regardless of the field type.
+            tokens.extend(quote! { .location(#oapi::oapi::parameter::ParameterIn::Query) });
         }
 
         if let Some(style) = param_features.pop_style_feature() {
@@ -613,15 +609,23 @@ impl TryToTokens for Parameter<'_> {
             });
             tokens.extend(param_features.try_to_token_stream()?);
 
-            let schema = ComponentSchema::for_params(component::ComponentSchemaProps {
-                type_tree: &component,
-                features: Some(schema_features),
-                description: None,
-                deprecated: None,
-                object_name: "",
-                compose_context: None,
-            })?
-            .to_token_stream();
+            let user_explicit_inline = schema_features
+                .iter()
+                .any(|f| matches!(f, Feature::Inline(Inline(true))));
+            let schema = if user_explicit_inline {
+                let oapi = crate::oapi_crate();
+                crate::component::build_inline_compose_block(&component, &oapi)
+            } else {
+                ComponentSchema::for_params(component::ComponentSchemaProps {
+                    type_tree: &component,
+                    features: Some(schema_features),
+                    description: None,
+                    deprecated: None,
+                    object_name: "",
+                    compose_context: None,
+                })?
+                .to_token_stream()
+            };
 
             tokens.extend(quote! { .schema(#schema) });
         }

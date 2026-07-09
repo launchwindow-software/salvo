@@ -21,7 +21,7 @@
 <a href="https://docs.rs/salvo"><img alt="Documentation" src="https://docs.rs/salvo/badge.svg" /></a>
 <a href="https://crates.io/crates/salvo"><img alt="Download" src="https://img.shields.io/crates/d/salvo.svg" /></a>
 <a href="https://github.com/rust-secure-code/safety-dance/"><img alt="unsafe forbidden" src="https://img.shields.io/badge/unsafe-forbidden-success.svg" /></a>
-<a href="https://blog.rust-lang.org/2025/12/11/Rust-1.92.0/"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.92%2B-blue" /></a>
+<a href="https://blog.rust-lang.org/2026/03/05/Rust-1.94.0/"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.94%2B-blue" /></a>
 <br>
 <a href="https://salvo.rs">
     <img alt="Website" src="https://img.shields.io/badge/https-salvo.rs-%23f00" />
@@ -44,6 +44,45 @@ This is an official crate, so you can enable it in `Cargo.toml` like this:
 ```toml
 salvo = { version = "*", features = ["cors"] }
 ```
+
+## Quick Start
+
+Add the CORS handler to `Service`, not to `Router`. Browsers send preflight
+`OPTIONS` requests before the real request, and those preflight requests may not
+match any router branch.
+
+```rust
+use salvo::cors::Cors;
+use salvo::http::Method;
+use salvo::prelude::*;
+
+#[handler]
+async fn hello() -> &'static str {
+    "Hello World"
+}
+
+#[tokio::main]
+async fn main() {
+    let cors = Cors::new()
+        .allow_origin("https://example.com")
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers("content-type")
+        .into_handler();
+
+    let router = Router::new().get(hello);
+    let acceptor = TcpListener::new("127.0.0.1:7878").bind().await;
+
+    Server::new(acceptor)
+        .serve(Service::new(router).hoop(cors))
+        .await;
+}
+```
+
+For development-only APIs you can use `Cors::permissive()`. For authenticated
+production APIs, prefer explicit origins and avoid `Cors::very_permissive()`.
+`Cors::very_permissive()` reflects each request's `Origin` while allowing
+credentials, so browsers treat arbitrary calling sites as explicitly trusted
+for authenticated responses.
 
 ## Documentation & Resources
 

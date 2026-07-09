@@ -14,6 +14,7 @@ compile_error!(
 use hyper::server::conn::http1;
 #[cfg(feature = "http2")]
 use hyper::server::conn::http2;
+use tokio::sync::Semaphore;
 #[cfg(feature = "server-handle")]
 use tokio::{
     sync::{
@@ -29,8 +30,7 @@ use crate::Service;
 #[cfg(feature = "quinn")]
 use crate::conn::quinn;
 use crate::conn::{Accepted, Acceptor, Coupler, Holding, HttpBuilder};
-use crate::fuse::{ArcFuseFactory, FuseFactory};
-use crate::http::{HeaderValue, Version};
+use crate::fuse::{ArcFusePolicy, FuseConfig, FusePolicy};
 
 cfg_feature! {
     #![feature ="server-handle"]
@@ -48,11 +48,24 @@ cfg_feature! {
 
 #[cfg(feature = "server-handle")]
 impl ServerHandle {
-    /// Force stop server.
+    /// Forcefully stops the server immediately, without waiting for in-flight
+    /// requests to finish. The adjective parallels [`Self::stop_graceful`];
+    /// reach for that one when you want a clean shutdown.
+    pub fn stop_forceful(&self) {
+        let _ = self.tx_cmd.send(ServerCommand::StopForceful);
+    }
+
+    /// Deprecated alias for [`Self::stop_forceful`].
     ///
-    /// Call this function will stop server immediately.
+    /// The old name reads awkwardly (`forcible` is an adjective for things
+    /// that *can* be forced, not for the act of forcing, and it does not
+    /// parallel the adjective in `stop_graceful`). Use [`stop_forceful`] for
+    /// new code; this shim keeps existing callers compiling.
+    ///
+    /// [`stop_forceful`]: Self::stop_forceful
+    #[deprecated(since = "0.94.0", note = "use `ServerHandle::stop_forceful` instead")]
     pub fn stop_forcible(&self) {
-        let _ = self.tx_cmd.send(ServerCommand::StopForcible);
+        self.stop_forceful();
     }
 
     /// Graceful stop server.
@@ -80,7 +93,7 @@ impl ServerHandle {
     ///     let handle = server.handle();
     ///
     ///     // Graceful shutdown the server
-    ///       tokio::spawn(async move {
+    ///     tokio::spawn(async move {
     ///         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     ///         handle.stop_graceful(None);
     ///     });
@@ -96,17 +109,20 @@ impl ServerHandle {
 
 #[cfg(feature = "server-handle")]
 enum ServerCommand {
-    StopForcible,
+    StopForceful,
     StopGraceful(Option<Duration>),
 }
 
 /// HTTP Server.
 ///
-/// A `Server` is created to listen on a port, parse HTTP requests, and hand them off to a [`Service`].
+/// A `Server` is created to listen on a port, parse HTTP requests, and hand them off to a
+/// [`Service`].
 pub struct Server<A> {
     acceptor: A,
     builder: HttpBuilder,
-    fuse_factory: Option<ArcFuseFactory>,
+    fuse_policy: Option<ArcFusePolicy>,
+    /// Maximum number of concurrent connections; `None` means unlimited.
+    max_connections: Option<usize>,
     #[cfg(feature = "server-handle")]
     tx_cmd: UnboundedSender<ServerCommand>,
     #[cfg(feature = "server-handle")]
@@ -120,7 +136,7 @@ impl<A> Debug for Server<A> {
 }
 
 impl<A: Acceptor + Send> Server<A> {
-    /// Create new `Server` with [`Acceptor`].
+    /// Creates a new `Server` with an [`Acceptor`].
     ///
     /// # Example
     ///
@@ -137,14 +153,15 @@ impl<A: Acceptor + Send> Server<A> {
         Self::with_http_builder(acceptor, HttpBuilder::new())
     }
 
-    /// Create new `Server` with [`Acceptor`] and [`HttpBuilder`].
+    /// Creates a new `Server` with an [`Acceptor`] and [`HttpBuilder`].
     pub fn with_http_builder(acceptor: A, builder: HttpBuilder) -> Self {
         #[cfg(feature = "server-handle")]
         let (tx_cmd, rx_cmd) = tokio::sync::mpsc::unbounded_channel();
         Self {
             acceptor,
             builder,
-            fuse_factory: None,
+            fuse_policy: Some(Arc::new(FuseConfig::default())),
+            max_connections: None,
             #[cfg(feature = "server-handle")]
             tx_cmd,
             #[cfg(feature = "server-handle")]
@@ -152,13 +169,49 @@ impl<A: Acceptor + Send> Server<A> {
         }
     }
 
-    /// Set the fuse factory.
+    /// Sets a per-connection fuse policy, replacing the default.
+    ///
+    /// By default a server enables [`FuseConfig::default()`], the safe handshake + header
+    /// timeouts. Use this to make admission decisions per connection.
     #[must_use]
-    pub fn fuse_factory<F>(mut self, factory: F) -> Self
+    pub fn fuse_policy<F>(mut self, policy: F) -> Self
     where
-        F: FuseFactory + Send + Sync + 'static,
+        F: FusePolicy + Send + Sync + 'static,
     {
-        self.fuse_factory = Some(Arc::new(factory));
+        self.fuse_policy = Some(Arc::new(policy));
+        self
+    }
+
+    /// Uses the same fuse configuration for every accepted connection, replacing the default.
+    ///
+    /// A server defaults to [`FuseConfig::default()`] (handshake + header timeouts only); pass
+    /// [`FuseConfig::strict()`] for the full set, or a `with_*`-built config to tune it.
+    #[must_use]
+    pub fn fuse_config(mut self, config: FuseConfig) -> Self {
+        self.fuse_policy = Some(Arc::new(config));
+        self
+    }
+
+    /// Disables connection fuse protection entirely.
+    ///
+    /// Removes even the default handshake and header timeouts. Prefer leaving the default on,
+    /// or narrowing it with [`fuse_config`](Self::fuse_config), unless the connections are
+    /// already protected elsewhere.
+    #[must_use]
+    pub fn disable_fuse(mut self) -> Self {
+        self.fuse_policy = None;
+        self
+    }
+
+    /// Limit the number of concurrent connections the server will handle.
+    ///
+    /// Once `max` connections are active, the accept loop stops accepting new
+    /// connections (applying backpressure to the OS listen backlog) until an
+    /// existing connection closes. This bounds memory and file-descriptor use
+    /// under load or connection-exhaustion attacks. By default there is no limit.
+    #[must_use]
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = Some(max);
         self
     }
 
@@ -171,11 +224,17 @@ impl<A: Acceptor + Send> Server<A> {
             }
         }
 
-        /// Force stop server.
-        ///
-        /// Call this function will stop server immediately.
+        /// Forcefully stops the server immediately, without waiting for in-flight
+        /// requests to finish. The adjective parallels [`Self::stop_graceful`];
+        /// reach for that one when you want a clean shutdown.
+        pub fn stop_forceful(&self) {
+            let _ = self.tx_cmd.send(ServerCommand::StopForceful);
+        }
+
+        /// Deprecated alias for [`Self::stop_forceful`].
+        #[deprecated(since = "0.94.0", note = "use `Server::stop_forceful` instead")]
         pub fn stop_forcible(&self) {
-            let _ = self.tx_cmd.send(ServerCommand::StopForcible);
+            self.stop_forceful();
         }
 
         /// Graceful stop server.
@@ -197,6 +256,18 @@ impl<A: Acceptor + Send> Server<A> {
     cfg_feature! {
         #![feature = "http1"]
         /// Use this function to set http1 protocol.
+        ///
+        /// Note: `header_read_timeout` interacts with the fuse config. When the active
+        /// [`FuseConfig::http1_header_timeout`](crate::fuse::FuseConfig::http1_header_timeout)
+        /// is set (the on-by-default config sets it), it overrides any value set here; a value
+        /// set here applies only under [`disable_fuse`](Self::disable_fuse) or a fuse config
+        /// with that timeout left unset.
+        ///
+        /// Even then it only bounds Hyper's own header read, which begins *after* the initial
+        /// HTTP/1-vs-HTTP/2 protocol-detection read. It does **not** bound that detection read,
+        /// so a client that connects and sends nothing is not covered by it. To bound the
+        /// detection read too — the full Slowloris protection — set
+        /// [`FuseConfig::http1_header_timeout`], which is the single surface that governs both.
         pub fn http1_mut(&mut self) -> &mut http1::Builder {
             &mut self.builder.http1
         }
@@ -212,7 +283,7 @@ impl<A: Acceptor + Send> Server<A> {
 
     cfg_feature! {
         #![feature = "quinn"]
-        /// Use this function to set http3 protocol.
+        /// Use this function to set the HTTP/3 protocol.
         pub fn quinn_mut(&mut self) -> &mut quinn::Builder {
             &mut self.builder.quinn
         }
@@ -253,11 +324,12 @@ impl<A: Acceptor + Send> Server<A> {
     where
         S: Into<Service> + Send,
     {
-        async {
+        async move {
             let Self {
                 mut acceptor,
                 builder,
-                fuse_factory,
+                fuse_policy,
+                max_connections,
                 mut rx_cmd,
                 ..
             } = self;
@@ -265,41 +337,109 @@ impl<A: Acceptor + Send> Server<A> {
             let notify = Arc::new(Notify::new());
             let force_stop_token = CancellationToken::new();
             let graceful_stop_token = CancellationToken::new();
+            let conn_semaphore = max_connections.map(|max| Arc::new(Semaphore::new(max)));
 
+            #[cfg(not(feature = "quinn"))]
+            let alt_svc_h3 = None;
+            #[cfg(feature = "quinn")]
             let mut alt_svc_h3 = None;
+
             for holding in acceptor.holdings() {
                 tracing::info!("listening {}", holding);
-                if holding.http_versions.contains(&Version::HTTP_3)
-                    && let Some(addr) = holding.local_addr.clone().into_std()
+
+                #[cfg(feature = "quinn")]
                 {
-                    let port = addr.port();
-                    alt_svc_h3 = Some(
-                        format!(r#"h3=":{port}"; ma=2592000,h3-29=":{port}"; ma=2592000"#)
-                            .parse::<HeaderValue>()
-                            .expect("parsing alt-svc header should not fail"),
-                    );
+                    use crate::http::{HeaderValue, Version};
+
+                    if builder.quinn.auto_alt_svc_header
+                        && holding.http_versions.contains(&Version::HTTP_3)
+                        && let Some(addr) = holding.local_addr.clone().into_std()
+                    {
+                        let port = addr.port();
+                        alt_svc_h3 = Some(
+                            format!(r#"h3=":{port}"; ma=2592000,h3-29=":{port}"; ma=2592000"#)
+                                .parse::<HeaderValue>()
+                                .expect("parsing alt-svc header should not fail"),
+                        );
+                    }
                 }
             }
 
             let service: Arc<Service> = Arc::new(service.into());
             let builder = Arc::new(builder);
+            // Apply a received stop command. Used from both the permit-acquire and the
+            // accept `select!` so shutdown is observed even while saturated.
+            macro_rules! handle_stop_command {
+                ($cmd:expr) => {
+                    match $cmd {
+                        ServerCommand::StopGraceful(timeout) => {
+                            graceful_stop_token.cancel();
+                            if let Some(timeout) = timeout {
+                                tracing::info!(
+                                    timeout_in_seconds = timeout.as_secs_f32(),
+                                    "initiate graceful stop server",
+                                );
+                                let force_stop_token = force_stop_token.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(timeout).await;
+                                    force_stop_token.cancel();
+                                });
+                            } else {
+                                tracing::info!("initiate graceful stop server");
+                            }
+                        }
+                        ServerCommand::StopForceful => {
+                            tracing::info!("force stop server");
+                            force_stop_token.cancel();
+                        }
+                    }
+                };
+            }
             loop {
+                // Acquire a connection permit before accepting (backpressure when at
+                // `max_connections`). Race it against the stop channel so a *saturated*
+                // server (no free permit) still observes shutdown instead of blocking
+                // the accept loop forever in `acquire_owned`.
+                let permit = if let Some(semaphore) = &conn_semaphore {
+                    tokio::select! {
+                        biased;
+                        Some(cmd) = rx_cmd.recv() => {
+                            handle_stop_command!(cmd);
+                            break;
+                        }
+                        permit = semaphore.clone().acquire_owned() => {
+                            Some(permit.expect("connection semaphore is never closed"))
+                        }
+                    }
+                } else {
+                    None
+                };
                 tokio::select! {
-                    accepted = acceptor.accept(fuse_factory.clone()) => {
+                    accepted = acceptor.accept(fuse_policy.clone()) => {
                         match accepted {
-                            Ok(Accepted { coupler, stream, fusewire, local_addr, remote_addr, http_scheme}) => {
+                            Ok(Accepted { coupler, stream, fuse_config, conn_ctrl, local_addr, remote_addr, http_scheme}) => {
                                 alive_connections.fetch_add(1, Ordering::Release);
 
                                 let service = service.clone();
                                 let alive_connections = alive_connections.clone();
                                 let notify = notify.clone();
-                                let handler = service.hyper_handler(local_addr, remote_addr, http_scheme, fusewire, alt_svc_h3.clone());
+                                let handler = service.hyper_handler(
+                                    local_addr,
+                                    remote_addr,
+                                    http_scheme,
+                                    fuse_config,
+                                    conn_ctrl,
+                                    alt_svc_h3.clone(),
+                                );
                                 let builder = builder.clone();
 
                                 let force_stop_token = force_stop_token.clone();
                                 let graceful_stop_token = graceful_stop_token.clone();
 
                                 tokio::spawn(async move {
+                                    // Hold the permit for the connection's lifetime; it is
+                                    // released back to the semaphore when this task ends.
+                                    let _permit = permit;
                                     let conn = coupler.couple(stream, handler, builder, Some(graceful_stop_token.clone()));
                                     tokio::select! {
                                         _ = conn => {
@@ -319,34 +459,15 @@ impl<A: Acceptor + Send> Server<A> {
                             },
                             Err(e) => {
                                 tracing::error!(error = ?e, "accept connection failed");
+                                // Back off briefly so a persistent accept error
+                                // (e.g. `EMFILE` when out of file descriptors) does
+                                // not spin this loop at 100% CPU and flood the logs.
+                                tokio::time::sleep(Duration::from_millis(10)).await;
                             }
                         }
                     }
                     Some(cmd) = rx_cmd.recv() => {
-                        match cmd {
-                            ServerCommand::StopGraceful(timeout) => {
-                                let graceful_stop_token = graceful_stop_token.clone();
-                                graceful_stop_token.cancel();
-                                if let Some(timeout) = timeout {
-                                    tracing::info!(
-                                        timeout_in_seconds = timeout.as_secs_f32(),
-                                        "initiate graceful stop server",
-                                    );
-
-                                    let force_stop_token = force_stop_token.clone();
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(timeout).await;
-                                        force_stop_token.cancel();
-                                    });
-                                } else {
-                                    tracing::info!("initiate graceful stop server");
-                                }
-                            },
-                            ServerCommand::StopForcible => {
-                                tracing::info!("force stop server");
-                                force_stop_token.cancel();
-                            },
-                        }
+                        handle_stop_command!(cmd);
                         break;
                     },
                 }
@@ -357,7 +478,17 @@ impl<A: Acceptor + Send> Server<A> {
                     "wait for {} connections to close.",
                     alive_connections.load(Ordering::Acquire)
                 );
-                notify.notified().await;
+                // Re-check in a loop and also wake on a force-stop: a connection that
+                // ignores `force_stop_token` would otherwise never decrement the count,
+                // so a single `notify.notified().await` could hang shutdown forever.
+                while !force_stop_token.is_cancelled()
+                    && alive_connections.load(Ordering::Acquire) > 0
+                {
+                    tokio::select! {
+                        _ = notify.notified() => {}
+                        _ = force_stop_token.cancelled() => break,
+                    }
+                }
             }
 
             tracing::info!("server stopped");
@@ -373,14 +504,28 @@ impl<A: Acceptor + Send> Server<A> {
         let Self {
             mut acceptor,
             builder,
-            fuse_factory,
+            fuse_policy,
+            max_connections,
             ..
         } = self;
+        let conn_semaphore = max_connections.map(|max| Arc::new(Semaphore::new(max)));
+
+        #[cfg(not(feature = "quinn"))]
+        let alt_svc_h3 = None;
+        #[cfg(feature = "quinn")]
         let mut alt_svc_h3 = None;
+
         for holding in acceptor.holdings() {
             tracing::info!("listening {}", holding);
-            if holding.http_versions.contains(&Version::HTTP_3) {
-                if let Some(addr) = holding.local_addr.clone().into_std() {
+
+            #[cfg(feature = "quinn")]
+            {
+                use crate::http::{HeaderValue, Version};
+
+                if builder.quinn.auto_alt_svc_header
+                    && holding.http_versions.contains(&Version::HTTP_3)
+                    && let Some(addr) = holding.local_addr.clone().into_std()
+                {
                     let port = addr.port();
                     alt_svc_h3 = Some(
                         format!(r#"h3=":{port}"; ma=2592000,h3-29=":{port}"; ma=2592000"#)
@@ -394,11 +539,25 @@ impl<A: Acceptor + Send> Server<A> {
         let service: Arc<Service> = Arc::new(service.into());
         let builder = Arc::new(builder);
         loop {
-            match acceptor.accept(fuse_factory.clone()).await {
+            // Acquire a connection permit before accepting (backpressure when at
+            // `max_connections`). There is no graceful-stop channel in this build,
+            // so a plain blocking acquire is sufficient.
+            let permit = match &conn_semaphore {
+                Some(semaphore) => Some(
+                    semaphore
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .expect("connection semaphore is never closed"),
+                ),
+                None => None,
+            };
+            match acceptor.accept(fuse_policy.clone()).await {
                 Ok(Accepted {
                     coupler,
                     stream,
-                    fusewire,
+                    fuse_config,
+                    conn_ctrl,
                     local_addr,
                     remote_addr,
                     http_scheme,
@@ -409,17 +568,23 @@ impl<A: Acceptor + Send> Server<A> {
                         local_addr,
                         remote_addr,
                         http_scheme,
-                        fusewire,
+                        fuse_config,
+                        conn_ctrl,
                         alt_svc_h3.clone(),
                     );
                     let builder = builder.clone();
 
                     tokio::spawn(async move {
+                        let _permit = permit;
                         let _ = coupler.couple(stream, handler, builder, None).await;
                     });
                 }
                 Err(e) => {
                     tracing::error!(error = ?e, "accept connection failed");
+                    // Back off briefly so a persistent accept error (e.g. `EMFILE`
+                    // when the process is out of file descriptors) does not spin
+                    // this loop at 100% CPU and flood the logs.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
         }
@@ -506,8 +671,120 @@ mod tests {
 
     #[cfg(feature = "server-handle")]
     #[tokio::test]
+    async fn handler_abort_discards_the_response() {
+        use std::time::Duration;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use crate::conn::Acceptor;
+
+        #[handler]
+        async fn abort(res: &mut Response, conn: &mut ConnCtrl) {
+            conn.abort();
+            res.body("must not be sent");
+        }
+
+        let acceptor = crate::conn::TcpListener::new("127.0.0.1:0").bind().await;
+        let addr = acceptor.holdings()[0]
+            .local_addr
+            .clone()
+            .into_std()
+            .unwrap();
+        let server = Server::new(acceptor);
+        let handle = server.handle();
+        let server_task = tokio::spawn(server.try_serve(Router::new().goal(abort)));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut received))
+            .await
+            .expect("aborted connection should close promptly")
+            .unwrap();
+
+        assert!(
+            received.is_empty(),
+            "an aborted connection must not send an HTTP response"
+        );
+
+        handle.stop_forceful();
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[cfg(feature = "server-handle")]
+    #[tokio::test]
+    async fn graceful_stop_stays_abortable_when_a_handler_aborts() {
+        use std::sync::OnceLock;
+        use std::time::Duration;
+
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::Notify;
+
+        use crate::conn::Acceptor;
+
+        // Lets the test hold the handler in-flight until the server is mid graceful-drain.
+        static STARTED: OnceLock<Notify> = OnceLock::new();
+        static GO: OnceLock<Notify> = OnceLock::new();
+        fn started() -> &'static Notify {
+            STARTED.get_or_init(Notify::new)
+        }
+        fn go() -> &'static Notify {
+            GO.get_or_init(Notify::new)
+        }
+
+        #[handler]
+        async fn block_then_abort(res: &mut Response, conn: &mut ConnCtrl) {
+            started().notify_one();
+            go().notified().await;
+            conn.abort();
+            res.body("must not be sent");
+        }
+
+        let acceptor = crate::conn::TcpListener::new("127.0.0.1:0").bind().await;
+        let addr = acceptor.holdings()[0]
+            .local_addr
+            .clone()
+            .into_std()
+            .unwrap();
+        let server = Server::new(acceptor);
+        let handle = server.handle();
+        let server_task = tokio::spawn(server.try_serve(Router::new().goal(block_then_abort)));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+
+        // Keep the request in-flight so graceful shutdown drains an active connection.
+        tokio::time::timeout(Duration::from_secs(1), started().notified())
+            .await
+            .expect("handler should start");
+
+        // Server-wide graceful shutdown; let the serve loop enter the drain path first.
+        handle.stop_graceful(None);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The handler now aborts and its service future parks forever. The drain path must
+        // still observe the abort and drop the connection, or the server never stops.
+        go().notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("graceful stop must finish even when a handler aborts mid-drain")
+            .unwrap()
+            .unwrap();
+        drop(client);
+    }
+
+    #[cfg(feature = "server-handle")]
+    #[tokio::test]
     async fn test_server_handle_stop() {
         use std::time::Duration;
+
         use tokio::time::timeout;
 
         // Test forcible stop
@@ -519,7 +796,7 @@ mod tests {
         // Give server a moment to start
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        handle.stop_forcible();
+        handle.stop_forceful();
 
         let result = timeout(Duration::from_secs(1), server_task).await;
         assert!(
@@ -555,6 +832,56 @@ mod tests {
             server_result.unwrap().is_ok(),
             "try_serve should return Ok."
         );
+    }
+
+    #[cfg(feature = "server-handle")]
+    #[tokio::test]
+    async fn test_server_max_connections_stops_while_saturated() {
+        use std::time::Duration;
+
+        use tokio::io::AsyncWriteExt;
+        use tokio::time::timeout;
+
+        use crate::conn::Acceptor;
+
+        // A long-lived handler so the single allowed connection stays open and the
+        // accept loop is parked in `acquire_owned` with no free permit.
+        #[handler]
+        async fn slow() {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+
+        let acceptor = crate::conn::TcpListener::new("127.0.0.1:0").bind().await;
+        let addr = acceptor.holdings()[0]
+            .local_addr
+            .clone()
+            .into_std()
+            .unwrap();
+        let server = Server::new(acceptor).max_connections(1);
+        let handle = server.handle();
+        let server_task = tokio::spawn(server.try_serve(Router::new().goal(slow)));
+
+        // Saturate the single permit: open a connection and send a request that the
+        // slow handler keeps busy, so no permit is free.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Force stop must break the accept loop even though it is saturated.
+        handle.stop_forceful();
+        let result = timeout(Duration::from_secs(2), server_task).await;
+        assert!(
+            result.is_ok(),
+            "saturated connection-limited server must still force-stop"
+        );
+        assert!(
+            result.unwrap().unwrap().is_ok(),
+            "try_serve should return Ok"
+        );
+        drop(stream);
     }
 
     #[test]
@@ -636,4 +963,3 @@ mod tests {
         };
     }
 }
-

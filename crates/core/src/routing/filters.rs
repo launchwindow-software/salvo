@@ -18,6 +18,32 @@ use crate::http::uri::Scheme;
 use crate::http::{Method, Request};
 use crate::routing::PathState;
 
+/// Structured description of a [`Filter`], used by `Router`'s `Debug`
+/// implementation and by `salvo-oapi` to introspect a routing tree.
+///
+/// Each built-in filter overrides [`Filter::info`] to return the matching
+/// variant. Custom filters fall back to [`FilterInfo::Other`] with the
+/// implementing type's name. Returning structured data instead of relying on
+/// the `Debug` string format keeps consumers from breaking when a filter's
+/// `Debug` representation changes.
+#[derive(Clone, Debug)]
+pub enum FilterInfo {
+    /// Path pattern (raw, unparsed) of a [`PathFilter`].
+    Path(String),
+    /// HTTP method matched by a [`MethodFilter`].
+    Method(Method),
+    /// URI scheme matched by a [`SchemeFilter`].
+    Scheme(Scheme),
+    /// Host name matched by a [`HostFilter`].
+    Host(String),
+    /// Port matched by a [`PortFilter`].
+    Port(u16),
+    /// Catch-all for filter types that do not expose structured info — typically
+    /// composite filters (`And`, `Or`, `AndThen`, `OrElse`), `FnFilter`, or
+    /// user-defined filters. Carries the implementor's type name.
+    Other(&'static str),
+}
+
 /// Trait for filter request.
 ///
 /// View [module level documentation](../index.html) for more details.
@@ -31,6 +57,16 @@ pub trait Filter: Debug + Send + Sync + 'static {
     #[doc(hidden)]
     fn type_name(&self) -> &'static str {
         std::any::type_name::<Self>()
+    }
+
+    /// Returns a structured description of what this filter matches.
+    ///
+    /// The default returns [`FilterInfo::Other`] with the implementing type's
+    /// name. Built-in filters override this to expose typed data so that
+    /// downstream code (router debug printing, OpenAPI introspection) does
+    /// not have to scrape the [`Debug`] output.
+    fn info(&self) -> FilterInfo {
+        FilterInfo::Other(self.type_name())
     }
     /// Create a new filter use `And` filter.
     #[inline]
@@ -63,7 +99,7 @@ pub trait Filter: Debug + Send + Sync + 'static {
     fn and_then<F>(self, fun: F) -> AndThen<Self, F>
     where
         Self: Sized,
-        F: Fn(&mut Request, &mut PathState) -> bool + Send + Sync + 'static,
+        F: for<'a> Fn(&mut Request, &mut PathState<'a>) -> bool + Send + Sync + 'static,
     {
         AndThen {
             filter: self,
@@ -76,7 +112,7 @@ pub trait Filter: Debug + Send + Sync + 'static {
     fn or_else<F>(self, fun: F) -> OrElse<Self, F>
     where
         Self: Sized,
-        F: Fn(&mut Request, &mut PathState) -> bool + Send + Sync + 'static,
+        F: for<'a> Fn(&mut Request, &mut PathState<'a>) -> bool + Send + Sync + 'static,
     {
         OrElse {
             filter: self,
@@ -85,7 +121,7 @@ pub trait Filter: Debug + Send + Sync + 'static {
     }
 
     /// Filter `Request` and returns false or true.
-    async fn filter(&self, req: &mut Request, path: &mut PathState) -> bool;
+    async fn filter(&self, req: &mut Request, path: &mut PathState<'_>) -> bool;
 }
 
 /// `FnFilter` accepts a function as its parameter, using this function to filter requests.
@@ -96,10 +132,10 @@ pub struct FnFilter<F>(pub F);
 #[async_trait]
 impl<F> Filter for FnFilter<F>
 where
-    F: Fn(&mut Request, &mut PathState) -> bool + Send + Sync + 'static,
+    F: for<'a> Fn(&mut Request, &mut PathState<'a>) -> bool + Send + Sync + 'static,
 {
     #[inline]
-    async fn filter(&self, req: &mut Request, path: &mut PathState) -> bool {
+    async fn filter(&self, req: &mut Request, path: &mut PathState<'_>) -> bool {
         self.0(req, path)
     }
 }
@@ -199,29 +235,29 @@ mod tests {
 
     #[test]
     fn test_methods() {
-        assert!(get() == MethodFilter(Method::GET));
-        assert!(head() == MethodFilter(Method::HEAD));
-        assert!(options() == MethodFilter(Method::OPTIONS));
-        assert!(post() == MethodFilter(Method::POST));
-        assert!(patch() == MethodFilter(Method::PATCH));
-        assert!(put() == MethodFilter(Method::PUT));
-        assert!(delete() == MethodFilter(Method::DELETE));
+        assert_eq!(get(), MethodFilter(Method::GET));
+        assert_eq!(head(), MethodFilter(Method::HEAD));
+        assert_eq!(options(), MethodFilter(Method::OPTIONS));
+        assert_eq!(post(), MethodFilter(Method::POST));
+        assert_eq!(patch(), MethodFilter(Method::PATCH));
+        assert_eq!(put(), MethodFilter(Method::PUT));
+        assert_eq!(delete(), MethodFilter(Method::DELETE));
     }
 
     #[tokio::test]
     async fn test_opts() {
-        fn has_one(_req: &mut Request, path: &mut PathState) -> bool {
-            path.parts.contains(&"one".into())
+        fn has_one(_req: &mut Request, path: &mut PathState<'_>) -> bool {
+            path.parts().any(|part| part == "one")
         }
-        fn has_two(_req: &mut Request, path: &mut PathState) -> bool {
-            path.parts.contains(&"two".into())
+        fn has_two(_req: &mut Request, path: &mut PathState<'_>) -> bool {
+            path.parts().any(|part| part == "two")
         }
 
         let one_filter = FnFilter(has_one);
         let two_filter = FnFilter(has_two);
 
         let mut req = Request::default();
-        let mut path_state = PathState::new("http://localhost/one");
+        let mut path_state = PathState::from_borrowed_path("http://localhost/one");
         assert!(one_filter.filter(&mut req, &mut path_state).await);
         assert!(!two_filter.filter(&mut req, &mut path_state).await);
         assert!(
@@ -249,7 +285,7 @@ mod tests {
                 .await
         );
 
-        let mut path_state = PathState::new("http://localhost/one/two");
+        let mut path_state = PathState::from_borrowed_path("http://localhost/one/two");
         assert!(one_filter.filter(&mut req, &mut path_state).await);
         assert!(two_filter.filter(&mut req, &mut path_state).await);
         assert!(
@@ -277,7 +313,7 @@ mod tests {
                 .await
         );
 
-        let mut path_state = PathState::new("http://localhost/two");
+        let mut path_state = PathState::from_borrowed_path("http://localhost/two");
         assert!(!one_filter.filter(&mut req, &mut path_state).await);
         assert!(two_filter.filter(&mut req, &mut path_state).await);
         assert!(

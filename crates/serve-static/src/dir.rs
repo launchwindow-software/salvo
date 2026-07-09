@@ -1,17 +1,19 @@
 //! Serve static directories with directory listing support
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fmt::{self, Debug, Display, Formatter, Write};
 use std::fs::Metadata;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::SystemTime;
 
 use salvo_core::fs::NamedFile;
 use salvo_core::handler::Handler;
-use salvo_core::http::header::ACCEPT_ENCODING;
-use salvo_core::http::{self, HeaderValue, Request, Response, StatusCode, StatusError, mime};
+use salvo_core::http::header::{ACCEPT_ENCODING, VARY};
+use salvo_core::http::{
+    self, HeaderMap, HeaderValue, Request, Response, StatusCode, StatusError, mime,
+};
 use salvo_core::routing::{
     decode_url_path, encode_url_path, normalize_url_path, redirect_to_dir_url,
 };
@@ -71,6 +73,21 @@ impl From<CompressionAlgo> for HeaderValue {
             CompressionAlgo::Gzip => Self::from_static("gzip"),
             CompressionAlgo::Zstd => Self::from_static("zstd"),
         }
+    }
+}
+
+fn append_vary_accept_encoding(headers: &mut HeaderMap) {
+    let already_varies = headers
+        .get_all(VARY)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|value| {
+            let value = value.trim();
+            value == "*" || value.eq_ignore_ascii_case("accept-encoding")
+        });
+    if !already_varies {
+        headers.append(VARY, HeaderValue::from_static("Accept-Encoding"));
     }
 }
 
@@ -136,7 +153,7 @@ where
 /// use salvo_serve_static::StaticDir;
 ///
 /// let router = Router::new().push(
-///     Router::with_path("static/<**>").get(
+///     Router::with_path("static/{**}").get(
 ///         StaticDir::new(["assets", "static"])
 ///             .defaults("index.html")
 ///             .auto_list(true),
@@ -149,6 +166,8 @@ pub struct StaticDir {
     pub roots: Vec<PathBuf>,
     /// Chunk size for file reading (in bytes)
     pub chunk_size: Option<u64>,
+    /// Small-file preload threshold for served files (in bytes)
+    pub preload_threshold: Option<u64>,
     /// Whether to include dot files (files/directories starting with .)
     pub include_dot_files: bool,
     exclude_filters: Vec<Box<dyn Fn(&str) -> bool + Send + Sync>>,
@@ -166,6 +185,7 @@ impl Debug for StaticDir {
         f.debug_struct("StaticDir")
             .field("roots", &self.roots)
             .field("chunk_size", &self.chunk_size)
+            .field("preload_threshold", &self.preload_threshold)
             .field("include_dot_files", &self.include_dot_files)
             .field("auto_list", &self.auto_list)
             .field("compressed_variations", &self.compressed_variations)
@@ -175,7 +195,7 @@ impl Debug for StaticDir {
     }
 }
 impl StaticDir {
-    /// Create new `StaticDir`.
+    /// Creates a new `StaticDir`.
     #[inline]
     pub fn new<T: StaticRoots + Sized>(roots: T) -> Self {
         let mut compressed_variations = HashMap::new();
@@ -187,6 +207,7 @@ impl StaticDir {
         Self {
             roots: roots.collect(),
             chunk_size: None,
+            preload_threshold: None,
             include_dot_files: false,
             exclude_filters: vec![],
             auto_list: false,
@@ -257,6 +278,9 @@ impl StaticDir {
     /// During the file chunk read, the maximum read size at one time will affect the
     /// access experience and the demand for server memory.
     ///
+    /// This controls streaming chunks and does not change `NamedFile`'s small-file preload
+    /// threshold.
+    ///
     /// Please set it according to your own situation.
     ///
     /// The default is 1M.
@@ -264,6 +288,18 @@ impl StaticDir {
     #[must_use]
     pub fn chunk_size(mut self, size: u64) -> Self {
         self.chunk_size = Some(size);
+        self
+    }
+
+    /// Sets the small-file preload threshold.
+    ///
+    /// Files whose size is less than or equal to this threshold are read during `NamedFile`
+    /// construction and sent from memory. Larger files are streamed in chunks. Set this to `0` to
+    /// disable preloading for non-empty files.
+    #[inline]
+    #[must_use]
+    pub fn preload_threshold(mut self, threshold: u64) -> Self {
+        self.preload_threshold = Some(threshold);
         self
     }
 
@@ -275,6 +311,77 @@ impl StaticDir {
             }
         }
         false
+    }
+}
+
+struct CanonicalRoot {
+    path: PathBuf,
+    canonical_path: PathBuf,
+}
+
+struct ResolvedPath {
+    path: PathBuf,
+    canonical_root: PathBuf,
+    metadata: Metadata,
+}
+
+impl StaticDir {
+    async fn canonical_roots(&self) -> Vec<CanonicalRoot> {
+        // `roots` is public, so derive canonical roots from the current value.
+        let mut roots = Vec::with_capacity(self.roots.len());
+        for root in &self.roots {
+            if let Ok(canonical) = tokio::fs::canonicalize(root).await {
+                roots.push(CanonicalRoot {
+                    path: root.clone(),
+                    canonical_path: canonical,
+                });
+            }
+        }
+        roots
+    }
+
+    async fn resolve_root_path(
+        &self,
+        root: &CanonicalRoot,
+        path: PathBuf,
+        apply_exclude_filters: bool,
+    ) -> Option<ResolvedPath> {
+        if apply_exclude_filters {
+            let raw_path = path_slash::PathBufExt::to_slash_lossy(&path);
+            if self.exclude_filters.iter().any(|filter| filter(&raw_path)) {
+                return None;
+            }
+        }
+
+        let metadata = tokio::fs::symlink_metadata(&path).await.ok()?;
+        let canonical_path = tokio::fs::canonicalize(&path).await.ok()?;
+        if !canonical_path.starts_with(&root.canonical_path) {
+            return None;
+        }
+        Some(ResolvedPath {
+            path,
+            canonical_root: root.canonical_path.clone(),
+            metadata,
+        })
+    }
+
+    async fn resolve_relative_path(
+        &self,
+        root: &CanonicalRoot,
+        rel_path: impl AsRef<Path>,
+    ) -> Option<ResolvedPath> {
+        self.resolve_root_path(root, root.path.join(rel_path), true)
+            .await
+    }
+
+    async fn resolve_child_path(&self, root: &Path, path: PathBuf) -> Option<ResolvedPath> {
+        let synthetic_root = CanonicalRoot {
+            path: root.to_owned(),
+            canonical_path: root.to_owned(),
+        };
+        // Apply exclude filters here too: default files (e.g. `index.html`) and
+        // compressed variants (e.g. `.gz`) must not bypass `exclude_filters`.
+        self.resolve_root_path(&synthetic_root, path, true).await
     }
 }
 #[derive(Serialize, Deserialize, Debug)]
@@ -337,10 +444,12 @@ impl Handler for StaticDir {
         _ctrl: &mut FlowCtrl,
     ) {
         let req_path = req.uri().path();
+        let decoded_path;
         let rel_path = if let Some(rest) = req.params().tail() {
             rest
         } else {
-            &*decode_url_path(req_path)
+            decoded_path = decode_url_path(req_path);
+            decoded_path.as_ref()
         };
         let rel_path = normalize_url_path(rel_path);
         let mut files: HashMap<String, Metadata> = HashMap::new();
@@ -351,37 +460,28 @@ impl Handler for StaticDir {
             .map(|s| s.starts_with('.'))
             .unwrap_or(false);
         let mut abs_path = None;
-        let mut abs_is_file = false;
+        let roots = self.canonical_roots().await;
         if self.include_dot_files || !is_dot_file {
-            for root in &self.roots {
-                let raw_path = join_path!(root, &rel_path);
-                // Security check to ensure that the accessed path is a subpath of the current root
-                // path.
-                if !Path::new(&raw_path).starts_with(root) {
-                    continue;
-                }
-                if self.exclude_filters.iter().any(|filter| filter(&raw_path)) {
-                    continue;
-                }
-                let path = PathBuf::from(&raw_path);
-                // Use a single async metadata call instead of multiple blocking is_file/is_dir
-                let meta = tokio::fs::symlink_metadata(&path).await;
-                if let Ok(meta) = meta {
-                    if meta.is_dir() {
+            for root in &roots {
+                // Use a single async symlink_metadata call for file type checks, then verify
+                // the canonical target stays under the canonical root before serving it.
+                if let Some(path) = self.resolve_relative_path(root, &rel_path).await {
+                    if path.metadata.is_dir() {
                         if !req_path.ends_with('/') && !req_path.is_empty() {
                             redirect_to_dir_url(req.uri(), res);
                             return;
                         }
 
-                        for ifile in &self.defaults {
-                            let ipath = path.join(ifile);
-                            if tokio::fs::symlink_metadata(&ipath)
+                        for default_file in &self.defaults {
+                            let default_path = path.path.join(default_file);
+                            let Some(default_path) = self
+                                .resolve_child_path(&path.canonical_root, default_path)
                                 .await
-                                .map(|m| m.is_file())
-                                .unwrap_or(false)
-                            {
-                                abs_path = Some(ipath);
-                                abs_is_file = true;
+                            else {
+                                continue;
+                            };
+                            if default_path.metadata.is_file() {
+                                abs_path = Some(default_path);
                                 break;
                             }
                         }
@@ -392,28 +492,20 @@ impl Handler for StaticDir {
                         if abs_path.is_some() {
                             break;
                         }
-                    } else if meta.is_file() {
+                    } else if path.metadata.is_file() {
                         abs_path = Some(path);
-                        abs_is_file = true;
                     }
                 }
             }
         }
         let fallback = self.fallback.as_deref().unwrap_or_default();
-        if abs_path.is_none() && !fallback.is_empty() {
-            for root in &self.roots {
-                let raw_path = join_path!(root, fallback);
-                if self.exclude_filters.iter().any(|filter| filter(&raw_path)) {
-                    continue;
-                }
-                let path = PathBuf::from(&raw_path);
-                if tokio::fs::symlink_metadata(&path)
-                    .await
-                    .map(|m| m.is_file())
-                    .unwrap_or(false)
-                {
+        if abs_path.is_none() && !fallback.is_empty() && is_safe_relative_path(fallback) {
+            for root in &roots {
+                if let Some(path) = self.resolve_relative_path(root, fallback).await {
+                    if !path.metadata.is_file() {
+                        continue;
+                    }
                     abs_path = Some(path);
-                    abs_is_file = true;
                     break;
                 }
             }
@@ -424,7 +516,9 @@ impl Handler for StaticDir {
             return;
         };
 
-        let is_file = abs_is_file;
+        let is_file = abs_path.metadata.is_file();
+        let canonical_root = abs_path.canonical_root;
+        let abs_path = abs_path.path;
 
         if is_file {
             let ext = abs_path
@@ -436,6 +530,7 @@ impl Handler for StaticDir {
                 .map(|ext| self.is_compressed_ext(ext))
                 .unwrap_or(false);
             let mut content_encoding = None;
+            let mut varies_on_accept_encoding = false;
             let content_type = mime_infer::from_path(&abs_path).first();
 
             let named_path = if !is_compressed_ext {
@@ -448,25 +543,34 @@ impl Handler for StaticDir {
                         .unwrap_or_default();
                     // Skip compressed variant lookup when client only accepts identity
                     if !header.is_empty() && header != "identity" {
-                        let accept_algos = http::parse_accept_encoding(header)
-                            .into_iter()
-                            .filter_map(|(algo, _level)| algo.parse::<CompressionAlgo>().ok())
-                            .collect::<HashSet<_>>();
-                        for (algo, exts) in &self.compressed_variations {
-                            if accept_algos.contains(algo) {
-                                for zip_ext in exts {
-                                    let mut path = abs_path.clone();
-                                    path.as_mut_os_string().push(".");
-                                    path.as_mut_os_string().push(zip_ext.as_str());
-                                    if tokio::fs::symlink_metadata(&path)
-                                        .await
-                                        .map(|m| m.is_file())
-                                        .unwrap_or(false)
-                                    {
-                                        new_abs_path = Some(path);
-                                        content_encoding = Some(algo.to_string());
-                                        break;
-                                    }
+                        varies_on_accept_encoding = true;
+                        'accepted_encoding: for (algo, level) in http::parse_accept_encoding(header)
+                        {
+                            if level == 0 {
+                                continue;
+                            }
+                            if algo.eq_ignore_ascii_case("identity") {
+                                break;
+                            }
+                            let Ok(algo) = algo.parse::<CompressionAlgo>() else {
+                                continue;
+                            };
+                            let Some(exts) = self.compressed_variations.get(&algo) else {
+                                continue;
+                            };
+                            for zip_ext in exts {
+                                let mut path = abs_path.clone();
+                                path.as_mut_os_string().push(".");
+                                path.as_mut_os_string().push(zip_ext.as_str());
+                                if self
+                                    .resolve_child_path(&canonical_root, path.clone())
+                                    .await
+                                    .map(|path| path.metadata.is_file())
+                                    .unwrap_or(false)
+                                {
+                                    new_abs_path = Some(path);
+                                    content_encoding = Some(algo.to_string());
+                                    break 'accepted_encoding;
                                 }
                             }
                         }
@@ -479,7 +583,7 @@ impl Handler for StaticDir {
                 abs_path
             };
 
-            let builder = {
+            let (builder, varies_on_accept_encoding) = {
                 let mut builder = NamedFile::builder(named_path);
                 if let Some(content_encoding) = content_encoding {
                     builder = builder.content_encoding(content_encoding);
@@ -487,14 +591,20 @@ impl Handler for StaticDir {
                 if let Some(size) = self.chunk_size {
                     builder = builder.buffer_size(size);
                 }
+                if let Some(threshold) = self.preload_threshold {
+                    builder = builder.preload_threshold(threshold);
+                }
                 if let Some(content_type) = content_type {
                     builder = builder.content_type(content_type);
                 }
-                builder
+                (builder, varies_on_accept_encoding)
             };
             if let Ok(named_file) = builder.build().await {
                 let headers = req.headers();
                 named_file.send(headers, res).await;
+                if varies_on_accept_encoding {
+                    append_vary_accept_encoding(res.headers_mut());
+                }
             } else {
                 res.render(StatusError::internal_server_error().brief("read file failed"));
             }
@@ -530,7 +640,7 @@ impl Handler for StaticDir {
                 .map(|(name, metadata)| DirInfo::new(name, &metadata))
                 .collect();
             dirs.sort_by(|a, b| a.name.cmp(&b.name));
-            let root = CurrentInfo::new(decode_url_path(req_path), files, dirs);
+            let root = CurrentInfo::new(decode_url_path(req_path).into_owned(), files, dirs);
             res.status_code(StatusCode::OK);
             match format.subtype().as_ref() {
                 "plain" => res.render(Text::Plain(list_text(&root))),
@@ -547,34 +657,61 @@ fn list_json(current: &CurrentInfo) -> String {
     json!(current).to_string()
 }
 fn list_xml(current: &CurrentInfo) -> String {
-    let mut ftxt = "<list>".to_owned();
+    let mut xml = "<list>".to_owned();
     if current.dirs.is_empty() && current.files.is_empty() {
-        ftxt.push_str("No files");
+        xml.push_str("No files");
     } else {
         let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
         for dir in &current.dirs {
             let _ = write!(
-                ftxt,
+                xml,
                 "<dir><name>{}</name><modified>{}</modified><link>{}</link></dir>",
-                dir.name,
-                dir.modified.format(&format).expect("format time failed"),
+                xml_escape(&dir.name),
+                dir.modified.format(&format).unwrap_or_else(|_| "-".into()),
                 encode_url_path(&dir.name),
             );
         }
         for file in &current.files {
             let _ = write!(
-                ftxt,
+                xml,
                 "<file><name>{}</name><modified>{}</modified><size>{}</size><link>{}</link></file>",
-                file.name,
-                file.modified.format(&format).expect("format time failed"),
+                xml_escape(&file.name),
+                file.modified.format(&format).unwrap_or_else(|_| "-".into()),
                 file.size,
                 encode_url_path(&file.name),
             );
         }
     }
-    ftxt.push_str("</list>");
-    ftxt
+    xml.push_str("</list>");
+    xml
 }
+
+fn is_safe_relative_path(path: &str) -> bool {
+    let path = Path::new(path);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+}
+
+/// Escape the five XML special characters. Also used for HTML text nodes and
+/// the page title in the directory listing: the escape set is identical, and
+/// unlike percent-encoding it is an actual markup escaper.
+fn xml_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 fn human_size(bytes: u64) -> String {
     let units = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
     let mut index = 0;
@@ -593,74 +730,73 @@ fn human_size(bytes: u64) -> String {
     format!("{} {}", bytes, units[index])
 }
 fn list_html(current: &CurrentInfo) -> String {
-    fn header_link(path: &str) -> String {
-        let segments = path
+    fn header_link(out: &mut String, path: &str) {
+        let _ = write!(out, r#"<a href="/">{HOME_ICON}</a>"#);
+        let mut link = String::new();
+        for seg in path
             .trim_start_matches('/')
             .trim_end_matches('/')
-            .split('/');
-        let mut link = "".to_owned();
-        format!(
-            r#"<a href="/">{}</a>{}"#,
-            HOME_ICON,
-            segments
-                .map(|seg| {
-                    link = format!("{link}/{}", encode_url_path(seg));
-                    format!("/<a href=\"{link}\">{}</a>", encode_url_path(seg))
-                })
-                .collect::<Vec<_>>()
-                .join("")
-        )
+            .split('/')
+        {
+            // URL-encode the href, but entity-escape the visible text: percent
+            // encoding is a URL escaper, not an HTML one, and it also renders
+            // non-ASCII names as unreadable `%xx` runs.
+            link.push('/');
+            link.push_str(&encode_url_path(seg));
+            let _ = write!(out, r#"/<a href="{link}">{}</a>"#, xml_escape(seg));
+        }
     }
-    let mut ftxt = format!(
+    let mut html = format!(
         r#"<!DOCTYPE html><html><head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width">
         <title>{}</title>
-        <style>{}</style></head><body><header><h3>Index of: {}</h3></header><hr/>"#,
-        encode_url_path(&current.path),
+        <style>{}</style></head><body><header><h3>Index of: "#,
+        xml_escape(&current.path),
         HTML_STYLE,
-        header_link(&current.path)
     );
+    header_link(&mut html, &current.path);
+    let _ = write!(html, "</h3></header><hr/>");
     if current.dirs.is_empty() && current.files.is_empty() {
-        let _ = write!(ftxt, "<p>No files</p>");
+        let _ = write!(html, "<p>No files</p>");
     } else {
-        let _ = write!(ftxt, "<table><tr><th>");
+        let _ = write!(html, "<table><tr><th>");
         if !(current.path.is_empty() || current.path == "/") {
-            let _ = write!(ftxt, "<a href=\"../\">[..]</a>");
+            let _ = write!(html, "<a href=\"../\">[..]</a>");
         }
         let _ = write!(
-            ftxt,
+            html,
             "</th><th>Name</th><th>Last modified</th><th>Size</th></tr>"
         );
         let format = format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
         for dir in &current.dirs {
             let _ = write!(
-                ftxt,
+                html,
                 r#"<tr><td>{}</td><td><a href="./{}/">{}</a></td><td>{}</td><td></td></tr>"#,
                 DIR_ICON,
                 encode_url_path(&dir.name),
-                encode_url_path(&dir.name),
-                dir.modified.format(&format).expect("format time failed"),
+                xml_escape(&dir.name),
+                dir.modified.format(&format).unwrap_or_else(|_| "-".into()),
             );
         }
         for file in &current.files {
             let _ = write!(
-                ftxt,
+                html,
                 r#"<tr><td>{}</td><td><a href="./{}">{}</a></td><td>{}</td><td>{}</td></tr>"#,
                 FILE_ICON,
                 encode_url_path(&file.name),
-                encode_url_path(&file.name),
-                file.modified.format(&format).expect("format time failed"),
+                xml_escape(&file.name),
+                file.modified.format(&format).unwrap_or_else(|_| "-".into()),
                 human_size(file.size)
             );
         }
-        let _ = write!(ftxt, "</table>");
+        let _ = write!(html, "</table>");
     }
     let _ = write!(
-        ftxt,
+        html,
         r#"<hr/><footer><a href="https://salvo.rs" target="_blank">salvo</a></footer></body>"#
     );
-    ftxt
+    html
 }
 fn list_text(current: &CurrentInfo) -> String {
     use std::fmt::Write;
@@ -670,7 +806,7 @@ fn list_text(current: &CurrentInfo) -> String {
         let _ = writeln!(
             txt,
             "[DIR]  {}  {}",
-            dir.modified.format(&format).expect("format time failed"),
+            dir.modified.format(&format).unwrap_or_else(|_| "-".into()),
             dir.name,
         );
     }
@@ -679,7 +815,7 @@ fn list_text(current: &CurrentInfo) -> String {
             txt,
             "{:>10}  {}  {}",
             human_size(file.size),
-            file.modified.format(&format).expect("format time failed"),
+            file.modified.format(&format).unwrap_or_else(|_| "-".into()),
             file.name,
         );
     }
@@ -725,7 +861,33 @@ const HOME_ICON: &str = r#"<svg aria-hidden="true" data-icon="home" viewBox="0 0
 
 #[cfg(test)]
 mod tests {
-    use crate::dir::human_size;
+    use crate::dir::{
+        CurrentInfo, DirInfo, FileInfo, human_size, is_safe_relative_path, list_html, xml_escape,
+    };
+
+    #[test]
+    fn test_list_html_escapes_visible_names() {
+        // Names in the listing are attacker-influenced only when the served
+        // directory is writable by untrusted parties, but the text nodes must be
+        // entity-escaped regardless — percent-encoding is a URL escaper, not an
+        // HTML one. (Names here need not be creatable on every filesystem; the
+        // renderer takes them as plain strings.)
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let file = temp.path().join("probe");
+        std::fs::write(&file, b"x").expect("write file");
+        let metadata = std::fs::metadata(&file).expect("metadata");
+
+        let files = vec![FileInfo::new("a&b'<c>.txt".to_owned(), &metadata)];
+        let dirs = vec![DirInfo::new(r#"d"ir&"#.to_owned(), &metadata)];
+        let html = list_html(&CurrentInfo::new("pa&th".to_owned(), files, dirs));
+
+        // Visible text is entity-escaped...
+        assert!(html.contains("a&amp;b&apos;&lt;c&gt;.txt"));
+        assert!(html.contains("d&quot;ir&amp;"));
+        assert!(html.contains("<title>pa&amp;th</title>"));
+        // ...and the raw markup-significant name never appears anywhere.
+        assert!(!html.contains("<c>.txt"));
+    }
 
     #[tokio::test]
     async fn test_convert_bytes_to_units() {
@@ -747,5 +909,22 @@ mod tests {
 
         assert_eq!("1 PB", human_size(unit * unit * unit * unit * unit));
         assert_eq!("1 PB", human_size(unit * unit * unit * unit * unit - 1));
+    }
+
+    #[test]
+    fn test_xml_escape() {
+        assert_eq!(
+            xml_escape(r#"<script a="b">'&</script>"#),
+            "&lt;script a=&quot;b&quot;&gt;&apos;&amp;&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn test_fallback_path_must_stay_relative() {
+        assert!(is_safe_relative_path("index.html"));
+        assert!(is_safe_relative_path("./spa/index.html"));
+        assert!(!is_safe_relative_path("../secret.html"));
+        assert!(!is_safe_relative_path("spa/../../secret.html"));
+        assert!(!is_safe_relative_path("/var/www/index.html"));
     }
 }

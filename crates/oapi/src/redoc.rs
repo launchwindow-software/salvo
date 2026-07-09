@@ -8,6 +8,8 @@ use salvo_core::writing::Text;
 use salvo_core::{async_trait, Depot, FlowCtrl, Handler, Request, Response, Router};
 use std::borrow::Cow;
 
+use crate::html::{description_meta, escape_html, json_string, keywords_meta};
+
 const INDEX_TMPL: &str = r#"
 <!DOCTYPE html>
 <html>
@@ -30,7 +32,7 @@ const INDEX_TMPL: &str = r#"
     <script src="{{lib_url}}"></script>
     <script>
       Redoc.init(
-        "{{spec_url}}",
+        {{spec_url}},
         {},
         document.getElementById("redoc-container")
       );
@@ -43,7 +45,7 @@ const INDEX_TMPL: &str = r#"
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ReDoc {
-    /// The title of the html page. The default title is "Scalar".
+    /// The title of the html page. The default title is "ReDoc".
     pub title: Cow<'static, str>,
     /// The version of the html page.
     pub keywords: Option<Cow<'static, str>>,
@@ -78,7 +80,7 @@ impl ReDoc {
         }
     }
 
-    /// Set title of the html page. The default title is "Scalar".
+    /// Set title of the html page. The default title is "ReDoc".
     #[must_use]
     pub fn title(mut self, title: impl Into<Cow<'static, str>>) -> Self {
         self.title = title.into();
@@ -106,7 +108,7 @@ impl ReDoc {
         self
     }
 
-    /// Consusmes the [`ReDoc`] and returns [`Router`] with the [`ReDoc`] as handler.
+    /// Consumes the [`ReDoc`] and returns [`Router`] with the [`ReDoc`] as handler.
     pub fn into_router(self, path: impl Into<String>) -> Router {
         Router::with_path(path.into()).goal(self)
     }
@@ -118,24 +120,19 @@ impl Handler for ReDoc {
         let keywords = self
             .keywords
             .as_ref()
-            .map(|s| {
-                format!(
-                    "<meta name=\"keywords\" content=\"{}\">",
-                    s.split(',').map(|s| s.trim()).collect::<Vec<_>>().join(",")
-                )
-            })
+            .map(|s| keywords_meta(s))
             .unwrap_or_default();
         let description = self
             .description
             .as_ref()
-            .map(|s| format!("<meta name=\"description\" content=\"{s}\">"))
+            .map(|s| description_meta(s))
             .unwrap_or_default();
         let html = INDEX_TMPL
-            .replacen("{{spec_url}}", &self.spec_url, 1)
-            .replacen("{{lib_url}}", &self.lib_url, 1)
+            .replacen("{{spec_url}}", &json_string(&self.spec_url), 1)
+            .replacen("{{lib_url}}", &escape_html(&self.lib_url), 1)
             .replacen("{{description}}", &description, 1)
             .replacen("{{keywords}}", &keywords, 1)
-            .replacen("{{title}}", &self.title, 1);
+            .replacen("{{title}}", &escape_html(&self.title), 1);
         res.render(Text::Html(html));
     }
 }

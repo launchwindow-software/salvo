@@ -1,10 +1,12 @@
 use std::fmt::Debug;
 
-use aead::generic_array::GenericArray;
-use aead::{Aead, KeyInit};
+use aead::array::Array;
+use aead::consts::U12;
+use aead::{Aead, Key, KeyInit};
 use aes_gcm::Aes256Gcm;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use subtle::ConstantTimeEq;
 
 use super::CsrfCipher;
 
@@ -37,7 +39,7 @@ impl AesGcmCipher {
 
     #[inline]
     fn aead(&self) -> Aes256Gcm {
-        let key = GenericArray::clone_from_slice(&self.aead_key);
+        let key = Key::<Aes256Gcm>::try_from(&self.aead_key[..]).expect("invalid key length");
         Aes256Gcm::new(&key)
     }
 }
@@ -51,10 +53,16 @@ impl CsrfCipher for AesGcmCipher {
             if token.len() < 8 || proof.len() < 20 {
                 false
             } else {
-                let nonce = GenericArray::from_slice(&proof[0..12]);
+                let nonce = Array::<u8, U12>::try_from(&proof[0..12]).expect("invalid nonce");
                 let aead = self.aead();
-                aead.decrypt(nonce, &proof[12..])
-                    .map(|p| p == token)
+                aead.decrypt(&nonce, &proof[12..])
+                    .map(|p| {
+                        // Compare lengths first, then use constant-time compare
+                        // on the recovered plaintext vs. the client-supplied
+                        // token. Avoids leaking the prefix length of a valid
+                        // token through timing.
+                        p.len() == token.len() && bool::from(p.ct_eq(&token))
+                    })
                     .unwrap_or(false)
             }
         } else {
@@ -65,10 +73,10 @@ impl CsrfCipher for AesGcmCipher {
         let token = self.random_bytes(self.token_size);
         let aead = self.aead();
         let mut proof = self.random_bytes(12);
-        let nonce = GenericArray::from_slice(&proof);
+        let nonce = Array::<u8, U12>::try_from(&proof[..]).expect("invalid nonce");
         proof.append(
             &mut aead
-                .encrypt(nonce, token.as_slice())
+                .encrypt(&nonce, token.as_slice())
                 .expect("encryption failed"),
         );
         (URL_SAFE_NO_PAD.encode(token), URL_SAFE_NO_PAD.encode(proof))

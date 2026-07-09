@@ -36,15 +36,13 @@ pub async fn route() -> Router {
         .allow_headers("authentication")
         .into_handler();
 
-    let router = Router::new()
+    Router::new()
         .hoop(cors)
         .hoop(affix_state::inject(connection))
         .get(hello_world)
         .push(Router::with_path("hello").get(hello))
         .push(get_users_router())
-        .push(get_users_router());
-
-    router
+        .push(get_users_router())
 }
 
 pub fn service(router: Router) -> Service {
@@ -109,7 +107,7 @@ pub mod tests {
         let response = TestClient::post("http://localhost/users")
             .json(&serde_json::json!({
                 "email": "samanidarix@gmail.com",
-                // "fullname": "Darix SAMANI SIEWE",
+                // "full_name": "Darix SAMANI SIEWE",
                 "password": "Testpassword15$"
             }))
             .send(&service)
@@ -125,7 +123,7 @@ pub mod tests {
         let mut response = TestClient::post("http://localhost/users")
             .json(&serde_json::json!({
                 "email": "samanidarix@gmail.com",
-                "fullname": "Darix SAMANI SIEWE",
+                "full_name": "Darix SAMANI SIEWE",
                 "password": "Testpassword15$"
             }))
             .send(&service)
@@ -145,7 +143,7 @@ pub mod tests {
         let mut response = TestClient::post("http://localhost/users")
             .json(&serde_json::json!({
                 "email": "samanidarix@gmail.com",
-                "fullname": "Darix SAMANI SIEWE",
+                "full_name": "Darix SAMANI SIEWE",
                 "password": "Testpassword15$"
             }))
             .send(&service)
@@ -296,7 +294,7 @@ pub mod tests {
             TestClient::put(format!("http://localhost/users/{}", user_information.id))
                 .add_header("authentication", token.token, true)
                 .json(&serde_json::json!({
-                    "fullname": "Darix SAMANI"
+                    "full_name": "Darix SAMANI"
                 }))
                 .send(&service)
                 .await;

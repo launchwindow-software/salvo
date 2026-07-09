@@ -8,14 +8,13 @@ version = "0.1.0"
 authors = ["chrislearn <chris@acroidea.com>"]
 edition = "2024"
 publish = false
-rust-version = "1.92"
+rust-version = "1.94"
 description = """
 Salvo is a powerful web framework that can make your work easier.
 """
 homepage = "https://salvo.rs"
 repository = "https://github.com/salvo-rs/salvo"
 documentation = "https://docs.rs/salvo/"
-readme = "./README.md"
 keywords = ["http", "async", "web", "framework", "server"]
 license = "Apache-2.0"
 categories = [
@@ -40,13 +39,12 @@ eyre = "0.6.12"
 tera = "1.20.1"
 futures = "0.3.31"
 
-opentelemetry = "0.31"
-opentelemetry-appender-tracing = "0.31"
-opentelemetry-http = "0.31"
-opentelemetry-otlp = "0.31"
-opentelemetry_sdk = "0.31"
-opentelemetry-semantic-conventions = "0.31"
-tracing-opentelemetry = "0.32.0"
+opentelemetry = "0.32"
+opentelemetry-appender-tracing = "0.32"
+opentelemetry-http = "0.32"
+opentelemetry-otlp = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-semantic-conventions = "0.32"
 
 argon2 = "0.5.3"
 dotenvy = "0.15.6"

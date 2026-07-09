@@ -10,7 +10,7 @@ use bytes::Bytes;
 #[cfg(feature = "cookie")]
 use cookie::{Cookie, CookieJar};
 use http::Extensions;
-use http::header::{AsHeaderName, CONTENT_TYPE, HeaderMap, HeaderValue, IntoHeaderName};
+use http::header::{ACCEPT, AsHeaderName, CONTENT_TYPE, HeaderMap, HeaderValue, IntoHeaderName};
 use http::method::Method;
 pub use http::request::Parts;
 use http::uri::{Scheme, Uri};
@@ -42,8 +42,14 @@ pub fn global_secure_max_size() -> usize {
 
 /// Set secure maximum size globally.
 ///
-/// It is recommended to use the [`SecureMaxSize`] middleware to have finer-grained
-/// control over [`Request`].
+/// This sets the process-wide fallback limit for every request that does not
+/// have a route-specific or request-specific limit. Treat this value as a
+/// denial-of-service safety boundary: raising it in shared initialization code
+/// raises the default body-read and form-parse limit for the whole process.
+///
+/// It is recommended to use the [`SecureMaxSize`] middleware or
+/// [`Request::set_secure_max_size`] when only specific routes or handlers need
+/// to accept larger bodies.
 ///
 /// **Note**: The security maximum value applies to request body reads and form parsing,
 /// including multipart file uploads. Increase the limit if you need to accept large uploads.
@@ -51,7 +57,11 @@ pub fn set_global_secure_max_size(size: usize) {
     GLOBAL_SECURE_MAX_SIZE.store(size, Ordering::Relaxed);
 }
 
-/// Middleware for set the secure maximum size of request body.
+/// Middleware to set the secure maximum size of the request body.
+///
+/// Use this when only part of an application needs a different body limit. It
+/// avoids changing the process-wide fallback set by
+/// [`set_global_secure_max_size()`].
 ///
 /// **Note**: The security maximum value applies to request body reads and form parsing,
 /// including multipart file uploads. Increase the limit if you need to accept large uploads.
@@ -92,15 +102,20 @@ impl Handler for SecureMaxSize {
 ///   internally. Subsequent calls return the cached bytes.
 /// - [`form_data()`](Request::form_data) parses form data and caches the result. If the body has
 ///   already been consumed by `payload()`, it will use the cached bytes to parse the form.
+/// - [`replace_body()`](Request::replace_body), [`take_body()`](Request::take_body), and
+///   [`body_mut()`](Request::body_mut) invalidate cached payload and form data so cached data never
+///   describes an old body after the body is changed.
 ///
 /// # Size Limits
 ///
 /// To prevent denial-of-service attacks, the request body size is limited by default to 64KB.
 /// This can be configured using:
 ///
-/// - [`set_global_secure_max_size()`] - Set the global default limit
-/// - [`SecureMaxSize`] middleware - Set per-route limits
-/// - [`set_secure_max_size()`](Request::set_secure_max_size) - Set per-request limits
+/// - [`set_global_secure_max_size()`] - Set the process-wide fallback limit.
+/// - [`SecureMaxSize`] middleware - Set per-route limits without changing the fallback for
+///   unrelated routes.
+/// - [`set_secure_max_size()`](Request::set_secure_max_size) - Set per-request limits inside
+///   middleware or handlers.
 ///
 /// **Note**: Size limits apply to request body reads and form parsing, including
 /// multipart file uploads. Increase the limit if you need to accept large uploads.
@@ -327,8 +342,8 @@ impl Request {
 
     /// Returns a mutable reference to the associated URI.
     ///
-    /// *Notice: If you using this mutable reference to change the uri, you should change the
-    /// `params` and `queries` manually.*
+    /// **Note**: If you use this mutable reference to change the URI, you should change the
+    /// `params` and `queries` manually.
     ///
     /// # Examples
     ///
@@ -345,7 +360,7 @@ impl Request {
 
     /// Set the associated URI. `queries` will be reset.
     ///
-    /// *Notice: `params` will not reset.*
+    /// **Note**: `params` will not be reset.
     #[inline]
     pub fn set_uri(&mut self, uri: Uri) {
         self.uri = uri;
@@ -552,11 +567,11 @@ impl Request {
     ///
     /// # Note
     ///
-    /// Modifying the body directly may interfere with methods like
-    /// [`payload()`](Request::payload) and [`form_data()`](Request::form_data).
+    /// This clears cached payload and form data before exposing mutable body access.
     /// Use with caution.
     #[inline]
     pub fn body_mut(&mut self) -> &mut ReqBody {
+        self.clear_body_cache();
         &mut self.body
     }
 
@@ -564,20 +579,26 @@ impl Request {
     ///
     /// This is useful when you need to transform or wrap the request body.
     ///
-    /// # Note
-    ///
-    /// Replacing the body does not clear the cached payload or form data.
-    /// If you've already called [`payload()`](Request::payload), those cached
-    /// values will still be returned on subsequent calls.
+    /// This clears cached payload and form data so subsequent calls to
+    /// [`payload()`](Request::payload) and [`form_data()`](Request::form_data)
+    /// read from the new body.
     #[inline]
     pub fn replace_body(&mut self, body: ReqBody) -> ReqBody {
-        std::mem::replace(&mut self.body, body)
+        let old_body = std::mem::replace(&mut self.body, body);
+        self.clear_body_cache();
+        old_body
+    }
+
+    #[inline]
+    fn clear_body_cache(&mut self) {
+        self.payload = tokio::sync::OnceCell::new();
+        self.form_data = tokio::sync::OnceCell::new();
     }
 
     /// Takes the body from the request, leaving [`ReqBody::None`] in its place.
     ///
-    /// This consumes the body, making it unavailable for subsequent reads unless
-    /// it was already cached via [`payload()`](Request::payload).
+    /// This consumes the body and clears cached payload and form data so later
+    /// reads cannot observe data from the old body.
     ///
     /// # When to Use
     ///
@@ -588,11 +609,12 @@ impl Request {
     /// # Note
     ///
     /// Methods like [`payload()`](Request::payload) and [`form_data()`](Request::form_data)
-    /// call this internally. If those methods have already been called successfully,
-    /// the data is cached and can still be accessed.
+    /// manage their own internal body consumption while building fresh cache entries.
     #[inline]
     pub fn take_body(&mut self) -> ReqBody {
-        self.replace_body(ReqBody::None)
+        let old_body = std::mem::replace(&mut self.body, ReqBody::None);
+        self.clear_body_cache();
+        old_body
     }
 
     /// Returns a reference to the associated extensions.
@@ -612,7 +634,9 @@ impl Request {
     /// Sets the maximum allowed body size for this request.
     ///
     /// This overrides both the global default and any value set by the
-    /// [`SecureMaxSize`] middleware for this specific request.
+    /// [`SecureMaxSize`] middleware for this specific request. Prefer this or
+    /// [`SecureMaxSize`] when only one request path needs a larger body limit;
+    /// avoid raising the global fallback for route-specific upload needs.
     ///
     /// # Arguments
     ///
@@ -624,6 +648,26 @@ impl Request {
     /// multipart file uploads. Increase the limit if you need to accept large uploads.
     pub fn set_secure_max_size(&mut self, size: usize) {
         self.secure_max_size = Some(size);
+    }
+
+    /// Wraps the request body in a streaming size limit and also sets the
+    /// request's secure max size.
+    ///
+    /// This is useful for middleware that must enforce the limit even when a
+    /// downstream handler reads the body stream directly instead of using
+    /// [`payload()`](Request::payload) or [`form_data()`](Request::form_data).
+    #[inline]
+    pub fn limit_body(&mut self, max_size: usize) {
+        self.set_secure_max_size(max_size);
+        if self.body.is_none() {
+            return;
+        }
+
+        let body = self.take_body();
+        self.replace_body(ReqBody::Boxed {
+            inner: Box::pin(Limited::new(body, max_size)),
+            fuse_config: None,
+        });
     }
 
     /// Returns the maximum allowed body size for this request.
@@ -642,6 +686,16 @@ impl Request {
         fn is_wt_connect(&self) -> bool {
             let protocol = self.extensions().get::<salvo_http3::ext::Protocol>();
             matches!((self.method(), protocol), (&Method::CONNECT, Some(p)) if p == &salvo_http3::ext::Protocol::WEB_TRANSPORT)
+        }
+
+        /// Get the underlying Quinn connection for a WebTransport request.
+        ///
+        /// Returns a cheap clone of the connection handle while handling a
+        /// WebTransport `CONNECT` request. It can be used to inspect QUIC-level
+        /// state, such as [`quinn::Connection::stats`](crate::proto::quinn::Connection::stats).
+        #[inline]
+        pub fn quinn_connection(&self) -> Option<crate::proto::quinn::Connection> {
+            self.extensions.get::<crate::proto::quinn::Connection>().cloned()
         }
 
         /// Try to get a WebTransport session from the request.
@@ -727,16 +781,16 @@ impl Request {
     /// // types = [text/html, application/json]
     /// ```
     pub fn accept(&self) -> Vec<Mime> {
-        let mut list: Vec<Mime> = vec![];
-        if let Some(accept) = self.headers.get("accept").and_then(|h| h.to_str().ok()) {
-            let parts: Vec<&str> = accept.split(',').collect();
-            for part in parts {
-                if let Ok(mt) = part.parse() {
-                    list.push(mt);
-                }
-            }
-        }
-        list
+        self.headers
+            .get(ACCEPT)
+            .and_then(|h| h.to_str().ok())
+            .map(|accept| {
+                accept
+                    .split(',')
+                    .filter_map(|p| p.trim().parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Returns the first MIME type from the `Accept` header.
@@ -745,12 +799,10 @@ impl Request {
     /// Returns `None` if the `Accept` header is missing or empty.
     #[inline]
     pub fn first_accept(&self) -> Option<Mime> {
-        let mut accept = self.accept();
-        if !accept.is_empty() {
-            Some(accept.remove(0))
-        } else {
-            None
-        }
+        self.headers
+            .get(ACCEPT)
+            .and_then(|h| h.to_str().ok())
+            .and_then(|accept| accept.split(',').find_map(|p| p.trim().parse().ok()))
     }
 
     /// Returns the `Content-Type` header value as a [`Mime`] type.
@@ -807,6 +859,13 @@ impl Request {
     }
 
     /// Get param value from params.
+    ///
+    /// Returns `None` both when the key does not exist **and** when the value is
+    /// present but fails to deserialize to `T` — the two cases are
+    /// indistinguishable here. Use [`try_param()`](Request::try_param) when you
+    /// need to tell them apart or propagate the error with `?`, or declare a
+    /// strongly-typed extractor (see [`Extractible`])
+    /// to move parsing and validation out of the handler body entirely.
     #[inline]
     pub fn param<'de, T>(&'de self, key: &str) -> Option<T>
     where
@@ -816,6 +875,9 @@ impl Request {
     }
 
     /// Try to get param value from params.
+    ///
+    /// Unlike [`param()`](Request::param), a missing key and a failed parse are
+    /// reported as distinct [`ParseError`]s, so this is the `?`-friendly variant.
     #[inline]
     pub fn try_param<'de, T>(&'de self, key: &str) -> ParseResult<T>
     where
@@ -1113,20 +1175,27 @@ impl Request {
     /// ```
     #[inline]
     pub async fn payload_with_max_size(&mut self, max_size: usize) -> ParseResult<&Bytes> {
-        let body = self.take_body();
-        self.payload
-            .get_or_try_init(|| async {
-                let limited = Limited::new(body, max_size);
-                let collected = limited.collect().await.map_err(|e| {
-                    if e.is::<http_body_util::LengthLimitError>() {
-                        ParseError::PayloadTooLarge
-                    } else {
-                        ParseError::other(e)
-                    }
-                })?;
-                Ok(collected.to_bytes())
-            })
-            .await
+        if self.payload.get().is_none() {
+            let body = std::mem::replace(&mut self.body, ReqBody::None);
+            self.payload
+                .get_or_try_init(|| async {
+                    let limited = Limited::new(body, max_size);
+                    let collected = limited.collect().await.map_err(|e| {
+                        if is_length_limit_error(e.as_ref()) {
+                            ParseError::PayloadTooLarge
+                        } else {
+                            ParseError::other(e)
+                        }
+                    })?;
+                    Ok(collected.to_bytes())
+                })
+                .await
+        } else {
+            Ok(self
+                .payload
+                .get()
+                .expect("payload cache should be initialized"))
+        }
     }
 
     /// Get [`FormData`] reference from request with the default size limit.
@@ -1201,9 +1270,15 @@ impl Request {
     /// ```
     #[inline]
     pub async fn form_data_max_size(&mut self, max_size: usize) -> ParseResult<&FormData> {
+        if self.form_data.get().is_some() {
+            return Ok(self
+                .form_data
+                .get()
+                .expect("form data cache should be initialized"));
+        }
         if let Some(ctype) = self.content_type() {
-            if ctype.subtype() == mime::WWW_FORM_URLENCODED || ctype.type_() == mime::MULTIPART {
-                let body = self.take_body();
+            if is_form_content_type(&ctype) {
+                let body = std::mem::replace(&mut self.body, ReqBody::None);
                 if body.is_none() {
                     let bytes = self.payload_with_max_size(max_size).await?.to_owned();
                     let headers = self.headers();
@@ -1386,7 +1461,7 @@ impl Request {
         T: Deserialize<'de>,
     {
         if let Some(ctype) = self.content_type()
-            && (ctype.subtype() == mime::WWW_FORM_URLENCODED || ctype.subtype() == mime::FORM_DATA)
+            && is_form_content_type(&ctype)
         {
             from_str_multi_map(self.form_data().await?.fields.iter_all())
                 .map_err(ParseError::Deserialize)
@@ -1429,7 +1504,7 @@ impl Request {
         T: Deserialize<'de>,
     {
         if let Some(ctype) = self.content_type() {
-            if ctype.subtype() == mime::WWW_FORM_URLENCODED || ctype.subtype() == mime::FORM_DATA {
+            if is_form_content_type(&ctype) {
                 return from_str_multi_map(
                     self.form_data_max_size(max_size).await?.fields.iter_all(),
                 )
@@ -1442,6 +1517,35 @@ impl Request {
         }
         Err(ParseError::InvalidContentType)
     }
+}
+
+/// Whether a content type denotes form data this request can parse, i.e.
+/// `application/x-www-form-urlencoded` or any `multipart/*` (the underlying
+/// [`FormData`] reader keys off the multipart boundary). Keeping the predicate in
+/// one place ensures `form_data*`, `parse_form` and `parse_body*` agree on what is
+/// accepted instead of diverging on exotic `multipart/*` subtypes.
+fn is_form_content_type(ctype: &Mime) -> bool {
+    ctype.subtype() == mime::WWW_FORM_URLENCODED || ctype.type_() == mime::MULTIPART
+}
+
+fn is_length_limit_error(error: &(dyn StdError + 'static)) -> bool {
+    if error.is::<http_body_util::LengthLimitError>() {
+        return true;
+    }
+    if let Some(error) = error.downcast_ref::<std::io::Error>()
+        && let Some(inner) = error.get_ref()
+        && is_length_limit_error(inner)
+    {
+        return true;
+    }
+    let mut source = error.source();
+    while let Some(error) = source {
+        if error.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = error.source();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1548,6 +1652,33 @@ file content\r\n\
         assert_eq!(file.headers().get("content-type").unwrap(), "text/plain");
         let files = req.files("file1").await.unwrap();
         assert_eq!(files[0].name().unwrap(), "err.txt");
+
+        let mut req: Request = TestClient::post("http://127.0.0.1:8698/hello")
+            .add_header(
+                "content-type",
+                "multipart/form-data; boundary=----WebKitFormBoundaryNoPartContentType",
+                true,
+            )
+            .body(
+                "------WebKitFormBoundaryNoPartContentType\r\n\
+Content-Disposition: form-data; name=\"file1\"; filename=\"err.txt\"\r\n\r\n\
+file content\r\n\
+------WebKitFormBoundaryNoPartContentType--\r\n",
+            )
+            .build();
+        let file = req.file("file1").await.unwrap();
+        assert_eq!(file.name().unwrap(), "err.txt");
+    }
+
+    #[tokio::test]
+    async fn test_form_data_multipart_requires_boundary() {
+        let mut req = TestClient::post("http://127.0.0.1:8698/upload")
+            .add_header("content-type", "multipart/form-data", true)
+            .body("ignored")
+            .build();
+
+        let err = req.form_data().await.unwrap_err();
+        assert!(matches!(err, ParseError::InvalidContentType));
     }
 
     /// Test that `form_data()` works correctly after `payload()` has been accessed.
@@ -1609,6 +1740,71 @@ Hello World\r\n\
         let file = form_data.files.get("file").unwrap();
         assert_eq!(file.name().unwrap(), "test.txt");
         assert_eq!(file.content_type().unwrap(), "text/plain");
+    }
+
+    #[tokio::test]
+    async fn test_replace_body_refreshes_payload() {
+        let mut req = TestClient::post("http://127.0.0.1:8698/form")
+            .add_header("content-type", "application/x-www-form-urlencoded", true)
+            .raw_form("username=first")
+            .build();
+
+        let payload = req.payload().await.unwrap().clone();
+        assert_eq!(payload.as_ref(), b"username=first");
+
+        req.replace_body(ReqBody::from("username=second"));
+
+        let payload = req.payload().await.unwrap();
+        assert_eq!(payload.as_ref(), b"username=second");
+    }
+
+    #[tokio::test]
+    async fn test_replace_body_refreshes_form_data() {
+        let mut req = TestClient::post("http://127.0.0.1:8698/form")
+            .add_header("content-type", "application/x-www-form-urlencoded", true)
+            .raw_form("username=first")
+            .build();
+
+        let form_data = req.form_data().await.unwrap();
+        assert_eq!(form_data.fields.get("username").unwrap(), "first");
+
+        req.replace_body(ReqBody::from("username=second"));
+
+        let form_data = req.form_data().await.unwrap();
+        assert_eq!(form_data.fields.get("username").unwrap(), "second");
+    }
+
+    #[tokio::test]
+    async fn test_take_body_clears_cached_payload() {
+        let mut req = TestClient::post("http://127.0.0.1:8698/form")
+            .add_header("content-type", "application/x-www-form-urlencoded", true)
+            .raw_form("username=first")
+            .build();
+
+        let payload = req.payload().await.unwrap().clone();
+        assert_eq!(payload.as_ref(), b"username=first");
+
+        let old_body = req.take_body();
+        assert!(old_body.is_none());
+
+        let payload = req.payload().await.unwrap();
+        assert!(payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_body_mut_clears_cached_payload() {
+        let mut req = TestClient::post("http://127.0.0.1:8698/form")
+            .add_header("content-type", "application/x-www-form-urlencoded", true)
+            .raw_form("username=first")
+            .build();
+
+        let payload = req.payload().await.unwrap().clone();
+        assert_eq!(payload.as_ref(), b"username=first");
+
+        *req.body_mut() = ReqBody::from("username=second");
+
+        let payload = req.payload().await.unwrap();
+        assert_eq!(payload.as_ref(), b"username=second");
     }
 
     #[tokio::test]

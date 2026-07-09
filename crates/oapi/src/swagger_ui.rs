@@ -16,6 +16,8 @@ use salvo_core::routing::redirect_to_dir_url;
 use salvo_core::{Depot, Error, FlowCtrl, Handler, Request, Response, Router, async_trait};
 use serde::Serialize;
 
+use crate::html::{description_meta, escape_html, keywords_meta, script_safe_json};
+
 #[derive(RustEmbed)]
 #[folder = "src/swagger_ui/v5.32.4"]
 struct SwaggerUiDist;
@@ -173,7 +175,7 @@ impl SwaggerUi {
         self
     }
 
-    /// Add oauth [`oauth::Config`] into [`SwaggerUi`].
+    /// Add OAuth [`oauth::Config`] into [`SwaggerUi`].
     ///
     /// Method takes one argument which exposes the [`oauth::Config`] to the user.
     ///
@@ -198,7 +200,7 @@ impl SwaggerUi {
         self
     }
 
-    /// Consusmes the [`SwaggerUi`] and returns [`Router`] with the [`SwaggerUi`] as handler.
+    /// Consumes the [`SwaggerUi`] and returns [`Router`] with the [`SwaggerUi`] as handler.
     pub fn into_router(self, path: impl Into<String>) -> Router {
         Router::with_path(format!("{}/{{**}}", path.into())).goal(self)
     }
@@ -223,17 +225,12 @@ impl Handler for SwaggerUi {
         let keywords = self
             .keywords
             .as_ref()
-            .map(|s| {
-                format!(
-                    "<meta name=\"keywords\" content=\"{}\">",
-                    s.split(',').map(|s| s.trim()).collect::<Vec<_>>().join(",")
-                )
-            })
+            .map(|s| keywords_meta(s))
             .unwrap_or_default();
         let description = self
             .description
             .as_ref()
-            .map(|s| format!("<meta name=\"description\" content=\"{s}\">"))
+            .map(|s| description_meta(s))
             .unwrap_or_default();
         match serve(path, &self.title, &keywords, &description, &self.config) {
             Ok(Some(file)) => {
@@ -266,7 +263,7 @@ pub struct Url<'a> {
 }
 
 impl<'a> Url<'a> {
-    /// Create new [`Url`].
+    /// Creates a new [`Url`].
     ///
     /// Name is shown in the select dropdown when there are multiple docs in Swagger UI.
     ///
@@ -287,7 +284,7 @@ impl<'a> Url<'a> {
         }
     }
 
-    /// Create new [`Url`] with primary flag.
+    /// Creates a new [`Url`] with the primary flag.
     ///
     /// Primary flag allows users to override the default behavior of the Swagger UI for selecting the primary
     /// doc to display. By default when there are multiple docs in Swagger UI the first one in the list
@@ -380,17 +377,19 @@ pub fn serve<'a>(
     };
 
     let bytes = if path == "index.html" {
-        let config_json = serde_json::to_string(&config)?;
+        // The config is embedded into an inline `<script>` block, so escape any
+        // characters that could break out of the script context (e.g. `</script>`).
+        let config_json = script_safe_json(serde_json::to_string(&config)?);
 
         // Replace {{config}} with pretty config json and remove the curly brackets `{ }` from beginning and the end.
         let mut index = INDEX_TMPL
             .replacen("{{config}}", &config_json, 1)
             .replacen("{{description}}", description, 1)
             .replacen("{{keywords}}", keywords, 1)
-            .replacen("{{title}}", title, 1);
+            .replacen("{{title}}", &escape_html(title), 1);
 
         if let Some(oauth) = &config.oauth {
-            let oauth_json = serde_json::to_string(oauth)?;
+            let oauth_json = script_safe_json(serde_json::to_string(oauth)?);
             index = index.replace(
                 "//{{oauth}}",
                 &format!("window.ui.initOAuth({});", &oauth_json),
@@ -408,4 +407,27 @@ pub fn serve<'a>(
     });
 
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serve_index_escapes_config_for_script_context() {
+        // A url containing `</script>` must not be able to break out of the inline script.
+        let config = Config::new(["</script><script>alert(1)</script>"]);
+        let file = serve("index.html", "title", "", "", &config)
+            .expect("serve should succeed")
+            .expect("index.html should be served");
+        let html = String::from_utf8(file.bytes.into_owned()).expect("utf8");
+        assert!(
+            !html.contains("</script><script>alert(1)</script>"),
+            "raw script-breaking payload must not be present"
+        );
+        assert!(
+            html.contains("\\u003c/script\\u003e"),
+            "`<` must be escaped to \\u003c inside the config json"
+        );
+    }
 }

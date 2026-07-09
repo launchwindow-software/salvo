@@ -12,8 +12,6 @@ use salvo_http3::quinn as http3_quinn;
 use tokio_util::sync::CancellationToken;
 
 use crate::conn::{Coupler, HttpBuilder, IntoConfigStream};
-use crate::fuse::ArcFusewire;
-
 use crate::service::HyperHandler;
 
 mod builder;
@@ -21,20 +19,29 @@ pub use builder::Builder;
 mod listener;
 pub use listener::{QuinnAcceptor, QuinnListener};
 
-/// Http3 Connection.
+/// HTTP/3 connection.
 #[allow(dead_code)]
 pub struct QuinnConnection {
     inner: http3_quinn::Connection,
-    fusewire: Option<ArcFusewire>,
+    raw: quinn::Connection,
 }
 impl QuinnConnection {
-    pub(crate) fn new(inner: http3_quinn::Connection, fusewire: Option<ArcFusewire>) -> Self {
-        Self { inner, fusewire }
+    pub(crate) fn new(raw: quinn::Connection) -> Self {
+        Self {
+            inner: http3_quinn::Connection::new(raw.clone()),
+            raw,
+        }
     }
     /// Get inner quinn connection.
     #[must_use]
     pub fn into_inner(self) -> http3_quinn::Connection {
         self.inner
+    }
+
+    /// Get the underlying Quinn connection.
+    #[must_use]
+    pub fn quinn(&self) -> &quinn::Connection {
+        &self.raw
     }
 }
 impl Debug for QuinnConnection {
@@ -59,7 +66,7 @@ pub struct QuinnCoupler;
 impl Coupler for QuinnCoupler {
     type Stream = QuinnConnection;
 
-     fn couple(
+    fn couple(
         &self,
         stream: Self::Stream,
         handler: HyperHandler,
@@ -67,11 +74,12 @@ impl Coupler for QuinnCoupler {
         graceful_stop_token: Option<CancellationToken>,
     ) -> BoxFuture<'static, IoResult<()>> {
         async move {
-        builder
-            .quinn
-            .serve_connection(stream, handler, graceful_stop_token)
-            .await
-        }.boxed()
+            builder
+                .quinn
+                .serve_connection(stream, handler, graceful_stop_token)
+                .await
+        }
+        .boxed()
     }
 }
 impl Debug for QuinnCoupler {

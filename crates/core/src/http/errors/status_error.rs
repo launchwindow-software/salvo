@@ -4,7 +4,7 @@ use std::fmt::{self, Debug, Display, Formatter, Write};
 use crate::http::{ResBody, StatusCode};
 use crate::{Response, Scribe};
 
-/// Result type with `StatusError` has it's error type.
+/// Result type with `StatusError` as its error type.
 pub type StatusResult<T> = Result<T, StatusError>;
 
 macro_rules! default_errors {
@@ -35,17 +35,32 @@ macro_rules! default_errors {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct StatusError {
-    /// Http error status code.
+    /// HTTP error status code.
     pub code: StatusCode,
-    /// Http error name.
+    /// HTTP error name.
     pub name: String,
-    /// Brief information about http error.
+    /// Brief information about the HTTP error.
     pub brief: String,
-    /// Detail information about http error.
+    /// Detailed information about the HTTP error.
     pub detail: Option<String>,
-    /// Cause about http error. Similar to the `origin` field, but using [`std::error::Error`].
+    /// The underlying error, as a [`std::error::Error`] trait object.
+    ///
+    /// Choose `cause` when you have a real error value and want it reported
+    /// through standard error tooling: it is exposed as this type's
+    /// [`Error::source`](std::error::Error::source) (the standard method that
+    /// replaced the deprecated `Error::cause` in Rust 1.30 — "cause" survives
+    /// here as the field name, `source()` is the API that reports it), so both
+    /// `Display` output and error-chain walkers see it. Choose
+    /// [`origin`](Self::origin) instead when a later handler or catcher needs the
+    /// concrete value back via [`StatusError::downcast_origin`].
     pub cause: Option<Box<dyn StdError + Sync + Send + 'static>>,
-    /// Origin about http error. Similar to the `cause` field, but using [`std::any::Any`].
+    /// The value that produced this error, as a [`std::any::Any`] trait object.
+    ///
+    /// Unlike [`cause`](Self::cause), this keeps the concrete type recoverable:
+    /// store a value here when downstream code needs to inspect it via
+    /// [`StatusError::downcast_origin`] — e.g. a custom error page that branches
+    /// on a domain error type. The stored type does not need to implement
+    /// `Error`.
     pub origin: Option<Box<dyn std::any::Any + Sync + Send + 'static>>,
 }
 
@@ -167,10 +182,10 @@ impl StatusError {
         too_many_requests,                  StatusCode::TOO_MANY_REQUESTS,      "Too Many Requests", "Too many requests have been received recently.";
         /// 431 Request Header Fields Too Large
         /// [[RFC6585](https://tools.ietf.org/html/rfc6585)]
-        request_header_fields_toolarge,     StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,    "Request Header Fields Too Large", "The server is unwilling to process the request because either  an individual header field, or all the header fields collectively, are too large.";
+        request_header_fields_too_large,    StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,    "Request Header Fields Too Large", "The server is unwilling to process the request because either an individual header field, or all the header fields collectively, are too large.";
          /// 451 Unavailable For Legal Reasons
          /// [[RFC7725](https://tools.ietf.org/html/rfc7725)]
-        unavailable_for_legalreasons,       StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,      "Unavailable For Legal Reasons", "The requested resource is unavailable due to a legal demand to deny access to this resource.";
+        unavailable_for_legal_reasons,      StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS,      "Unavailable For Legal Reasons", "The requested resource is unavailable due to a legal demand to deny access to this resource.";
         /// 500 Internal Server Error
         /// [[RFC7231, Section 6.6.1](https://tools.ietf.org/html/rfc7231#section-6.6.1)]
         internal_server_error,              StatusCode::INTERNAL_SERVER_ERROR,  "Internal Server Error", "The server encountered an internal error while processing this request.";
@@ -205,9 +220,35 @@ impl StatusError {
         /// [[RFC6585](https://tools.ietf.org/html/rfc6585)]
         network_authentication_required,    StatusCode::NETWORK_AUTHENTICATION_REQUIRED, "Network Authentication Required", "the client needs to authenticate to gain network access."
     }
+
+    /// Deprecated alias for [`Self::request_header_fields_too_large`].
+    #[must_use]
+    #[deprecated(
+        since = "0.94.0",
+        note = "use `StatusError::request_header_fields_too_large` instead"
+    )]
+    pub fn request_header_fields_toolarge() -> Self {
+        Self::request_header_fields_too_large()
+    }
+
+    /// Deprecated alias for [`Self::unavailable_for_legal_reasons`].
+    #[must_use]
+    #[deprecated(
+        since = "0.94.0",
+        note = "use `StatusError::unavailable_for_legal_reasons` instead"
+    )]
+    pub fn unavailable_for_legalreasons() -> Self {
+        Self::unavailable_for_legal_reasons()
+    }
 }
 
-impl StdError for StatusError {}
+impl StdError for StatusError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.cause
+            .as_deref()
+            .map(|cause| cause as &(dyn StdError + 'static))
+    }
+}
 
 impl Display for StatusError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
@@ -245,7 +286,7 @@ impl Display for StatusError {
 }
 
 impl StatusError {
-    /// Create new `StatusError` with code. If code is not error, it will be `None`.
+    /// Creates a new `StatusError` with a code. If the code is not an error, it will be `None`.
     #[must_use]
     pub fn from_code(code: StatusCode) -> Option<Self> {
         match code {
@@ -278,9 +319,11 @@ impl StatusError {
             StatusCode::PRECONDITION_REQUIRED => Some(Self::precondition_required()),
             StatusCode::TOO_MANY_REQUESTS => Some(Self::too_many_requests()),
             StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE => {
-                Some(Self::request_header_fields_toolarge())
+                Some(Self::request_header_fields_too_large())
             }
-            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS => Some(Self::unavailable_for_legalreasons()),
+            StatusCode::UNAVAILABLE_FOR_LEGAL_REASONS => {
+                Some(Self::unavailable_for_legal_reasons())
+            }
             StatusCode::INTERNAL_SERVER_ERROR => Some(Self::internal_server_error()),
             StatusCode::NOT_IMPLEMENTED => Some(Self::not_implemented()),
             StatusCode::BAD_GATEWAY => Some(Self::bad_gateway()),
@@ -304,5 +347,33 @@ impl Scribe for StatusError {
     fn render(self, res: &mut Response) {
         res.status_code = Some(self.code);
         res.body = ResBody::Error(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_source_exposes_cause() {
+        let io_err = std::io::Error::other("disk offline");
+        let err = StatusError::internal_server_error().cause(io_err);
+        let source = err.source().expect("cause should surface through source()");
+        assert_eq!(source.to_string(), "disk offline");
+
+        assert!(StatusError::internal_server_error().source().is_none());
+    }
+
+    #[allow(deprecated)]
+    #[test]
+    fn legacy_status_error_aliases_match_new_names() {
+        assert_eq!(
+            StatusError::request_header_fields_toolarge().code,
+            StatusError::request_header_fields_too_large().code
+        );
+        assert_eq!(
+            StatusError::unavailable_for_legalreasons().code,
+            StatusError::unavailable_for_legal_reasons().code
+        );
     }
 }

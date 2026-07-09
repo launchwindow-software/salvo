@@ -74,11 +74,8 @@
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::Deref;
 
-use salvo_core::{Depot, FlowCtrl, Handler, Request, Response, async_trait};
+use salvo_core::{Depot, FlowCtrl, Handler, Request, Response, async_trait, cfg_feature};
 use serde::{Deserialize, Serialize};
-
-#[macro_use]
-mod cfg;
 
 cfg_feature! {
     #![feature = "cookie-store"]
@@ -111,9 +108,12 @@ pub const INCOMING_FLASH_KEY: &str = "::salvo::flash::incoming_flash";
 /// Key for outgoing flash messages in depot.
 pub const OUTGOING_FLASH_KEY: &str = "::salvo::flash::outgoing_flash";
 
-/// A flash is a list of messages.
+/// A flash is a list of messages carried between requests.
 #[derive(Default, Serialize, Deserialize, Clone, Debug)]
-pub struct Flash(pub Vec<FlashMessage>);
+pub struct Flash(
+    /// The ordered list of flash messages buffered for the current request/response cycle.
+    pub Vec<FlashMessage>,
+);
 impl Flash {
     /// Add a new message with level `Debug`.
     #[inline]
@@ -197,7 +197,7 @@ impl FlashMessage {
             value: message.into(),
         }
     }
-    /// create a new `FlashMessage` with `FlashLevel::Error`.
+    /// Create a new `FlashMessage` with `FlashLevel::Error`.
     #[inline]
     pub fn error(message: impl Into<String>) -> Self {
         Self {
@@ -222,9 +222,9 @@ pub enum FlashLevel {
     Error = 4,
 }
 impl FlashLevel {
-    /// Convert a `FlashLevel` to a `&str`.
+    /// Returns the lowercase string representation of this `FlashLevel`.
     #[must_use]
-    pub fn to_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Debug => "debug",
             Self::Info => "info",
@@ -236,17 +236,17 @@ impl FlashLevel {
 }
 impl Debug for FlashLevel {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_str())
+        write!(f, "{}", self.as_str())
     }
 }
 
 impl Display for FlashLevel {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_str())
+        write!(f, "{}", self.as_str())
     }
 }
 
-/// `FlashStore` is for stores flash messages.
+/// `FlashStore` stores flash messages.
 pub trait FlashStore: Debug + Send + Sync + 'static {
     /// Get the flash messages from the store.
     fn load_flash(
@@ -263,17 +263,49 @@ pub trait FlashStore: Debug + Send + Sync + 'static {
         flash: Flash,
     ) -> impl Future<Output = ()> + Send;
     /// Clear the flash store.
-    fn clear_flash(&self, depot: &mut Depot, res: &mut Response)
-    -> impl Future<Output = ()> + Send;
+    fn clear_flash(
+        &self,
+        req: &mut Request,
+        depot: &mut Depot,
+        res: &mut Response,
+    ) -> impl Future<Output = ()> + Send;
 }
 
 /// A trait for `Depot` to get flash messages.
 pub trait FlashDepotExt {
     /// Get incoming flash.
     fn incoming_flash(&mut self) -> Option<&Flash>;
+    /// Get outgoing flash, or `None` if no [`FlashHandler`] is installed on the
+    /// route (so the outgoing flash was never initialized).
+    ///
+    /// Defaulted so that adding it is not a breaking change for existing
+    /// implementors of this trait; [`Depot`] overrides it with the real lookup.
+    fn try_outgoing_flash(&self) -> Option<&Flash> {
+        None
+    }
+    /// Get mutable outgoing flash, or `None` if no [`FlashHandler`] is installed on
+    /// the route.
+    ///
+    /// Defaulted so that adding it is not a breaking change for existing
+    /// implementors of this trait; [`Depot`] overrides it with the real lookup.
+    fn try_outgoing_flash_mut(&mut self) -> Option<&mut Flash> {
+        None
+    }
     /// Get outgoing flash.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no [`FlashHandler`] is installed on the route. Use
+    /// [`try_outgoing_flash`](Self::try_outgoing_flash) to handle that case without
+    /// panicking.
     fn outgoing_flash(&self) -> &Flash;
     /// Get mutable outgoing flash.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no [`FlashHandler`] is installed on the route. Use
+    /// [`try_outgoing_flash_mut`](Self::try_outgoing_flash_mut) to handle that case
+    /// without panicking.
     fn outgoing_flash_mut(&mut self) -> &mut Flash;
 }
 
@@ -284,15 +316,25 @@ impl FlashDepotExt for Depot {
     }
 
     #[inline]
+    fn try_outgoing_flash(&self) -> Option<&Flash> {
+        self.get::<Flash>(OUTGOING_FLASH_KEY).ok()
+    }
+
+    #[inline]
+    fn try_outgoing_flash_mut(&mut self) -> Option<&mut Flash> {
+        self.get_mut::<Flash>(OUTGOING_FLASH_KEY).ok()
+    }
+
+    #[inline]
     fn outgoing_flash(&self) -> &Flash {
-        self.get::<Flash>(OUTGOING_FLASH_KEY)
-            .expect("Flash should be initialized")
+        self.try_outgoing_flash()
+            .expect("`FlashHandler` must be installed to use the outgoing flash")
     }
 
     #[inline]
     fn outgoing_flash_mut(&mut self) -> &mut Flash {
-        self.get_mut::<Flash>(OUTGOING_FLASH_KEY)
-            .expect("Flash should be initialized")
+        self.try_outgoing_flash_mut()
+            .expect("`FlashHandler` must be installed to use the outgoing flash")
     }
 }
 
@@ -353,7 +395,9 @@ where
         }
 
         let mut flash = depot
-            .remove::<Flash>(OUTGOING_FLASH_KEY)
+            .remove(OUTGOING_FLASH_KEY)
+            .and_then(|v| v.downcast::<Flash>().ok())
+            .map(|v| *v)
             .unwrap_or_default();
         if let Some(min_level) = self.minimum_level {
             flash.0.retain(|msg| msg.level >= min_level);
@@ -361,7 +405,7 @@ where
         if !flash.is_empty() {
             self.store.save_flash(req, depot, res, flash).await;
         } else if has_incoming {
-            self.store.clear_flash(depot, res).await;
+            self.store.clear_flash(req, depot, res).await;
         }
     }
 }
@@ -610,12 +654,12 @@ mod tests {
 
     // Tests for FlashLevel
     #[test]
-    fn test_flash_level_to_str() {
-        assert_eq!(FlashLevel::Debug.to_str(), "debug");
-        assert_eq!(FlashLevel::Info.to_str(), "info");
-        assert_eq!(FlashLevel::Success.to_str(), "success");
-        assert_eq!(FlashLevel::Warning.to_str(), "warning");
-        assert_eq!(FlashLevel::Error.to_str(), "error");
+    fn test_flash_level_as_str() {
+        assert_eq!(FlashLevel::Debug.as_str(), "debug");
+        assert_eq!(FlashLevel::Info.as_str(), "info");
+        assert_eq!(FlashLevel::Success.as_str(), "success");
+        assert_eq!(FlashLevel::Warning.as_str(), "warning");
+        assert_eq!(FlashLevel::Error.as_str(), "error");
     }
 
     #[test]

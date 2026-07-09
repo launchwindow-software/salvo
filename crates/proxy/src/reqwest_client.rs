@@ -11,8 +11,8 @@ use crate::{BoxedError, Client, HyperRequest, HyperResponse, Proxy, Upstreams};
 /// A [`Client`] implementation based on [`reqwest::Client`].
 ///
 /// This client provides proxy capabilities using the Reqwest HTTP client.
-/// It supports all features of Reqwest including automatic redirect handling,
-/// connection pooling, and other HTTP client features.
+/// Redirect following is disabled by default for proxy safety. If you need to
+/// follow upstream redirects, pass a custom [`reqwest::Client`] to [`ReqwestClient::new`].
 #[derive(Clone, Debug)]
 pub struct ReqwestClient {
     inner: InnerClient,
@@ -35,7 +35,12 @@ impl Default for ReqwestClient {
     fn default() -> Self {
         #[cfg(feature = "ring")]
         let _ = rustls::crypto::ring::default_provider().install_default();
-        Self::new(InnerClient::builder().build().expect("failed to build reqwest client"))
+        Self::new(
+            InnerClient::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("failed to build reqwest client"),
+        )
     }
 }
 
@@ -58,23 +63,40 @@ impl Client for ReqwestClient {
         let request_upgrade_type =
             crate::get_upgrade_type(proxied_request.headers()).map(|s| s.to_owned());
 
-        let proxied_request = proxied_request
-            .map(|s| reqwest::Body::wrap_stream(s.map_ok(|s| s.into_data().unwrap_or_default())));
-        let response = self
+        let proxied_request = proxied_request.map(|body| {
+            // Forward only data frames; drop non-data frames (e.g. trailers, which
+            // reqwest cannot send anyway) instead of turning them into empty bytes,
+            // and propagate stream errors so a failed/aborted upstream body surfaces
+            // as an error rather than being silently truncated into a "successful" body.
+            reqwest::Body::wrap_stream(
+                body.try_filter_map(|frame| std::future::ready(Ok(frame.into_data().ok()))),
+            )
+        });
+        let mut response = self
             .inner
             .execute(proxied_request.try_into().map_err(Error::other)?)
             .await
             .map_err(Error::other)?;
 
-        let res_headers = response.headers().clone();
+        let status = response.status();
+        let version = response.version();
+        let response_upgrade_type = if status == StatusCode::SWITCHING_PROTOCOLS {
+            crate::get_upgrade_type(response.headers()).map(str::to_owned)
+        } else {
+            None
+        };
+        let res_headers = std::mem::take(response.headers_mut());
         let hyper_response = hyper::Response::builder()
-            .status(response.status())
-            .version(response.version());
+            .status(status)
+            .version(version);
 
-        let mut hyper_response = if response.status() == StatusCode::SWITCHING_PROTOCOLS {
-            let response_upgrade_type = crate::get_upgrade_type(response.headers());
-
-            if request_upgrade_type == response_upgrade_type.map(|s| s.to_lowercase()) {
+        let mut hyper_response = if status == StatusCode::SWITCHING_PROTOCOLS {
+            // RFC 7230 §6.7 makes Upgrade tokens case-insensitive (`websocket`,
+            // `WebSocket`, ... are all the same protocol). Compare without allocating.
+            if crate::upgrade_types_match(
+                request_upgrade_type.as_deref(),
+                response_upgrade_type.as_deref(),
+            ) {
                 let mut response_upgraded = response.upgrade().await.map_err(|e| {
                     Error::other(format!("response does not have an upgrade extension. {e}"))
                 })?;

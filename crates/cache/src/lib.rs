@@ -74,7 +74,9 @@
 //!
 //! Concurrent misses for the same cache key are coalesced. One request populates
 //! the cache, and other in-flight requests reuse the generated cache entry when
-//! the response is cacheable.
+//! the response is cacheable. At most [`DEFAULT_MAX_IN_FLIGHT`] distinct cache
+//! keys are coalesced at once by default; additional misses bypass coalescing and
+//! execute normally until an in-flight slot is released.
 //!
 //! # Limitations
 //!
@@ -95,15 +97,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use bytes::Bytes;
 use salvo_core::handler::Skipper;
+use salvo_core::http::header::{AUTHORIZATION, CACHE_CONTROL, COOKIE, SET_COOKIE, VARY};
 use salvo_core::http::{HeaderMap, ResBody, StatusCode};
-use salvo_core::{Depot, Error, FlowCtrl, Handler, Request, Response, async_trait};
+use salvo_core::{Depot, Error, FlowCtrl, Handler, Request, Response, async_trait, cfg_feature};
 use tokio::sync::Notify;
 
 mod skipper;
 pub use skipper::MethodSkipper;
-
-#[macro_use]
-mod cfg;
 
 cfg_feature! {
     #![feature = "moka-store"]
@@ -112,11 +112,11 @@ cfg_feature! {
     pub use moka_store::{MokaStore};
 }
 
-/// Issuer
+/// Issues a cache key for a request, deciding whether the request should be cached.
 pub trait CacheIssuer: Send + Sync + 'static {
-    /// The key is used to identify the rate limit.
+    /// The key type used to identify a cached entry.
     type Key: Hash + Eq + Send + Sync + 'static;
-    /// Issue a new key for the request. If it returns `None`, the request will not be cached.
+    /// Issue a key for the request. If it returns `None`, the request will not be cached.
     fn issue(
         &self,
         req: &mut Request,
@@ -130,11 +130,33 @@ where
 {
     type Key = K;
     async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        (self)(req, depot)
+        self(req, depot)
     }
 }
 
-/// Identify user by Request Uri.
+/// Identify cacheable requests by their URI.
+///
+/// # Caveats
+///
+/// The generated key is derived only from the request's scheme, authority,
+/// path, query, and (optionally) method. It does **not** include content
+/// negotiation headers such as `Accept-Encoding` or `Accept`. If the cached
+/// responses vary by those headers — for example when a compression middleware
+/// also runs — a client may receive a representation encoded for a different
+/// request (e.g. a `gzip` body without `Accept-Encoding: gzip`).
+///
+/// The cache stores the response produced by the handlers *inside* it (`hoop`s
+/// run outer-to-inner and the entry is captured on the way back out), so the
+/// negotiating middleware must run **outside** the cache — added to the router
+/// *before* the cache hoop — so it re-negotiates on every request, including
+/// cache hits. Alternatively, use a custom [`CacheIssuer`] that folds the
+/// relevant headers into the key.
+///
+/// Note that a `Vary` response header is **not** a fix here: the store never
+/// evaluates `Vary` at lookup time, so a `Vary` response is never cached (in
+/// either `cache_private` mode) — it would otherwise be replayed under the same
+/// key regardless of the request's negotiation headers. Fold the relevant headers
+/// into a custom [`CacheIssuer`] key instead.
 #[derive(Clone, Debug)]
 pub struct RequestIssuer {
     use_scheme: bool,
@@ -250,15 +272,26 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+/// Default maximum number of distinct cache keys tracked for concurrent miss coalescing.
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 1024;
+
 struct InFlight<K> {
     entries: Mutex<HashMap<K, Arc<Flight>>>,
+    max_entries: usize,
+}
+
+impl<K> InFlight<K> {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            max_entries,
+        }
+    }
 }
 
 impl<K> Default for InFlight<K> {
     fn default() -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-        }
+        Self::new(DEFAULT_MAX_IN_FLIGHT)
     }
 }
 
@@ -270,6 +303,9 @@ where
         let mut entries = mutex_lock(&self.entries);
         if let Some(flight) = entries.get(&key) {
             return FlightPermit::Follower(flight.clone());
+        }
+        if entries.len() >= self.max_entries {
+            return FlightPermit::Bypass;
         }
 
         let flight = Arc::new(Flight::default());
@@ -303,6 +339,7 @@ where
 {
     Leader(FlightGuard<K>),
     Follower(Arc<Flight>),
+    Bypass,
 }
 
 struct FlightGuard<K>
@@ -477,6 +514,7 @@ where
     pub issuer: I,
     /// Skipper.
     pub skipper: Box<dyn Skipper>,
+    cache_private: bool,
     in_flight: Arc<InFlight<S::Key>>,
 }
 impl<S, I> Debug for Cache<S, I>
@@ -505,6 +543,7 @@ where
             store,
             issuer,
             skipper: Box::new(skipper),
+            cache_private: false,
             in_flight: Arc::new(InFlight::default()),
         }
     }
@@ -515,11 +554,36 @@ where
         self.skipper = Box::new(skipper);
         self
     }
+
+    /// Allow caching requests or responses that contain private-user cache signals.
+    ///
+    /// By default, requests with `Authorization` or `Cookie`, and responses with `Set-Cookie`,
+    /// `Vary`, or `Cache-Control: private`, are not cached. Enabling this lifts those
+    /// privacy restrictions. `Cache-Control: no-store`/`no-cache` responses are never
+    /// cached regardless of this setting.
+    #[inline]
+    #[must_use]
+    pub fn cache_private(mut self, cache_private: bool) -> Self {
+        self.cache_private = cache_private;
+        self
+    }
+
+    /// Sets the maximum number of distinct cache keys tracked for concurrent miss coalescing.
+    ///
+    /// When this limit is reached, misses for new keys bypass coalescing and execute normally.
+    /// Existing in-flight keys can still be followed. Set to `0` to disable miss coalescing.
+    #[inline]
+    #[must_use]
+    pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
+        self.in_flight = Arc::new(InFlight::new(max_in_flight));
+        self
+    }
 }
 
 async fn call_next_and_cache<S>(
     store: &S,
     key: S::Key,
+    cache_private: bool,
     req: &mut Request,
     depot: &mut Depot,
     res: &mut Response,
@@ -528,19 +592,62 @@ async fn call_next_and_cache<S>(
 where
     S: CacheStore,
 {
+    // Snapshot the headers set by outer middleware *before* the inner handler
+    // runs, so only the headers the handler itself adds or changes are cached.
+    // This keeps per-request outer headers (e.g. `x-request-id`) out of the
+    // entry while still capturing headers the handler overwrites (e.g. CORS
+    // headers under `CallNext::After`).
+    let headers_before = res.headers().clone();
     ctrl.call_next(req, depot, res).await;
-    let cached_data = cached_response(res)?;
+    let cached_data = cached_response(res, &headers_before, cache_private)?;
     if let Err(e) = store.save_entry(key, cached_data.clone()).await {
         tracing::error!(error = ?e, "cache failed");
     }
     Some(cached_data)
 }
 
-fn cached_response(res: &Response) -> Option<CachedEntry> {
+fn cached_response(
+    res: &Response,
+    headers_before: &HeaderMap,
+    cache_private: bool,
+) -> Option<CachedEntry> {
     if res.body.is_stream() || res.body.is_error() {
         return None;
     }
-    let headers = res.headers().clone();
+    // Only cache successful responses. Use the *effective* status: a missing
+    // status code is sent as `200 OK` when a body is present but as `404` when
+    // the body is `None` (mirrors `Response::into_hyper`). Caching error or
+    // redirect statuses (e.g. a transient `500`, an auth-dependent `401`/`403`,
+    // or an empty unmatched `404`) would replay them to every client for the
+    // whole TTL.
+    let effective_status = res.status_code.unwrap_or(if res.body.is_none() {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::OK
+    });
+    if !effective_status.is_success() {
+        return None;
+    }
+    // `no-store`/`no-cache` forbid storing or reusing without revalidation in
+    // *any* cache, so they apply even in private-cache mode.
+    if response_disallows_caching(res.headers()) {
+        return None;
+    }
+    if !cache_private && response_has_private_cache_headers(res.headers()) {
+        return None;
+    }
+    // The entry can only record headers still present on the response, so a
+    // header the handler *removed* (one set by an outer middleware before the
+    // cache, now gone) cannot be represented. Replaying such an entry on a hit
+    // would leave the stale outer header in place, making hits differ from the
+    // cached miss. Skip caching instead of serving an inconsistent response.
+    if headers_before
+        .keys()
+        .any(|name| !res.headers().contains_key(name))
+    {
+        return None;
+    }
+    let headers = handler_response_headers(headers_before, res.headers());
     let body = match TryInto::<CachedBody>::try_into(&res.body) {
         Ok(body) => body,
         Err(e) => {
@@ -549,6 +656,62 @@ fn cached_response(res: &Response) -> Option<CachedEntry> {
         }
     };
     Some(CachedEntry::new(res.status_code, headers, body))
+}
+
+/// Headers the inner handler contributed, i.e. names whose values changed
+/// between `before` (set by outer middleware) and `after` (the final response).
+/// Headers left untouched by the handler are excluded so the cache does not
+/// replay a stale per-request value over the fresh one on later hits.
+fn handler_response_headers(before: &HeaderMap, after: &HeaderMap) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for name in after.keys() {
+        let after_values = after.get_all(name).iter().collect::<Vec<_>>();
+        let before_values = before.get_all(name).iter().collect::<Vec<_>>();
+        if after_values != before_values {
+            for value in after_values {
+                headers.append(name.clone(), value.clone());
+            }
+        }
+    }
+    headers
+}
+
+fn request_has_private_cache_headers(req: &Request) -> bool {
+    req.headers().contains_key(AUTHORIZATION) || req.headers().contains_key(COOKIE)
+}
+
+fn response_has_private_cache_headers(headers: &HeaderMap) -> bool {
+    headers.contains_key(SET_COOKIE) || cache_control_contains(headers, "private")
+}
+
+/// Directives/headers that forbid caching regardless of whether this is a shared
+/// or private cache. `no-store` bans storing the response anywhere; `no-cache`
+/// requires revalidation before reuse, which this middleware does not perform, so
+/// both are treated as non-cacheable rather than served blindly.
+///
+/// `Vary` is also handled here: this middleware never folds the varied request
+/// headers into the cache key, so it cannot tell two representations apart. Caching
+/// a `Vary` response (even in private mode) would replay one client's representation
+/// (e.g. a `gzip` body, or a specific `Accept-Language`) to clients that negotiated
+/// differently, so such responses are not cached at all.
+fn response_disallows_caching(headers: &HeaderMap) -> bool {
+    cache_control_contains(headers, "no-store")
+        || cache_control_contains(headers, "no-cache")
+        || headers.contains_key(VARY)
+}
+
+fn cache_control_contains(headers: &HeaderMap, directive: &str) -> bool {
+    headers.get_all(CACHE_CONTROL).iter().any(|value| {
+        value.to_str().ok().is_some_and(|value| {
+            value.split(',').any(|part| {
+                let part = part.trim();
+                part.eq_ignore_ascii_case(directive)
+                    || part
+                        .split_once('=')
+                        .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case(directive))
+            })
+        })
+    })
 }
 
 #[async_trait]
@@ -565,18 +728,32 @@ where
         res: &mut Response,
         ctrl: &mut FlowCtrl,
     ) {
-        if self.skipper.skipped(req, depot) {
+        if self.skipper.skipped(req, depot)
+            || (!self.cache_private && request_has_private_cache_headers(req))
+        {
             ctrl.call_next(req, depot, res).await;
             return;
         }
         let Some(key) = self.issuer.issue(req, depot).await else {
+            // No cache key means "do not cache this request"; still run the rest
+            // of the chain so the handler executes instead of returning an empty
+            // response.
+            ctrl.call_next(req, depot, res).await;
             return;
         };
         let Some(cache) = self.store.load_entry(&key).await else {
             match self.in_flight.enter(key.clone()) {
                 FlightPermit::Leader(guard) => {
-                    let cached_data =
-                        call_next_and_cache(&self.store, key, req, depot, res, ctrl).await;
+                    let cached_data = call_next_and_cache(
+                        &self.store,
+                        key,
+                        self.cache_private,
+                        req,
+                        depot,
+                        res,
+                        ctrl,
+                    )
+                    .await;
                     guard.finish(cached_data);
                 }
                 FlightPermit::Follower(flight) => {
@@ -585,8 +762,29 @@ where
                         respond_from_cache(res, cache);
                         ctrl.skip_rest();
                     } else {
-                        call_next_and_cache(&self.store, key, req, depot, res, ctrl).await;
+                        call_next_and_cache(
+                            &self.store,
+                            key,
+                            self.cache_private,
+                            req,
+                            depot,
+                            res,
+                            ctrl,
+                        )
+                        .await;
                     }
+                }
+                FlightPermit::Bypass => {
+                    call_next_and_cache(
+                        &self.store,
+                        key,
+                        self.cache_private,
+                        req,
+                        depot,
+                        res,
+                        ctrl,
+                    )
+                    .await;
                 }
             }
             return;
@@ -605,7 +803,21 @@ fn respond_from_cache(res: &mut Response, cache: CachedEntry) {
     if let Some(status) = status {
         res.status_code(status);
     }
-    *res.headers_mut() = headers;
+    // Merge the cached headers into the response rather than replacing the whole
+    // map, so headers set by outer middleware (request id, CORS, security
+    // headers) on *this* request are preserved. The entry only holds the headers
+    // the cached handler itself produced (see `handler_response_headers`), so a
+    // cached header fully replaces any same-named value — restoring handler
+    // overrides — while untouched outer headers are left as their fresh value.
+    let res_headers = res.headers_mut();
+    for name in headers.keys() {
+        res_headers.remove(name);
+        // Re-insert every cached value, keeping multi-valued headers such as
+        // `Set-Cookie` intact.
+        for value in headers.get_all(name) {
+            res_headers.append(name.clone(), value.clone());
+        }
+    }
     *res.body_mut() = body.into();
 }
 
@@ -684,6 +896,77 @@ mod tests {
         let content2 = res.take_string().await.unwrap();
 
         assert_ne!(content0, content2);
+    }
+
+    #[handler]
+    async fn server_error(res: &mut Response) {
+        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+        res.render(format!("error at {}", OffsetDateTime::now_utc()));
+    }
+
+    #[tokio::test]
+    async fn test_cache_skips_non_success_status() {
+        let cache = Cache::new(
+            MokaStore::builder()
+                .time_to_live(std::time::Duration::from_secs(5))
+                .build(),
+            RequestIssuer::default(),
+        );
+        let router = Router::new().hoop(cache).goal(server_error);
+        let service = Service::new(router);
+
+        let mut res = TestClient::get("http://127.0.0.1:5802")
+            .send(&service)
+            .await;
+        assert_eq!(res.status_code.unwrap(), StatusCode::INTERNAL_SERVER_ERROR);
+        let content0 = res.take_string().await.unwrap();
+
+        // A non-success response must not be cached, so the backend runs again
+        // and produces a fresh (different) body.
+        let mut res = TestClient::get("http://127.0.0.1:5802")
+            .send(&service)
+            .await;
+        let content1 = res.take_string().await.unwrap();
+        assert_ne!(content0, content1);
+    }
+
+    #[tokio::test]
+    async fn test_cache_issuer_none_runs_handler() {
+        let cache = Cache::new(
+            MokaStore::builder()
+                .time_to_live(std::time::Duration::from_secs(5))
+                .build(),
+            // Issuer that never produces a key: requests must still be handled.
+            |_req: &mut Request, _depot: &Depot| Option::<String>::None,
+        );
+        let router = Router::new().hoop(cache).goal(cached);
+        let service = Service::new(router);
+
+        let mut res = TestClient::get("http://127.0.0.1:5803")
+            .send(&service)
+            .await;
+        assert_eq!(res.status_code.unwrap(), StatusCode::OK);
+        let body = res.take_string().await.unwrap();
+        assert!(body.contains("Hello World"));
+    }
+
+    #[test]
+    fn test_cached_response_skips_empty_unmatched_404() {
+        // No status code + empty body is sent as `404 NOT_FOUND`
+        // (see `Response::into_hyper`), so its effective status is non-success
+        // and it must not be cached.
+        let res = Response::new();
+        assert!(res.status_code.is_none() && res.body.is_none());
+        assert!(cached_response(&res, &HeaderMap::new(), false).is_none());
+    }
+
+    #[test]
+    fn test_cached_response_caches_default_success() {
+        // No status code but a body present is sent as `200 OK`, so it is cached.
+        let mut res = Response::new();
+        res.render("ok");
+        assert!(res.status_code.is_none());
+        assert!(cached_response(&res, &HeaderMap::new(), false).is_some());
     }
 
     // Tests for RequestIssuer
@@ -910,6 +1193,119 @@ mod tests {
     }
 
     #[test]
+    fn handler_response_headers_excludes_untouched_outer_headers() {
+        // An outer middleware set `x-request-id` before the handler ran; the
+        // handler only added `content-type`. The per-request `x-request-id` must
+        // be left out of the entry so later hits keep their own fresh value.
+        let mut before = HeaderMap::new();
+        before.insert("x-request-id", "req-1".parse().unwrap());
+        let mut after = before.clone();
+        after.insert("content-type", "text/plain".parse().unwrap());
+
+        let stored = handler_response_headers(&before, &after);
+        assert!(!stored.contains_key("x-request-id"));
+        assert_eq!(stored.get("content-type").unwrap(), "text/plain");
+    }
+
+    #[test]
+    fn cached_response_skips_when_handler_removes_outer_header() {
+        // An outer middleware set `x-default` before the cache; the handler
+        // removed it. The entry cannot represent that deletion, so the response
+        // must not be cached (otherwise hits would keep the stale `x-default`).
+        let mut before = HeaderMap::new();
+        before.insert("x-default", "from-outer".parse().unwrap());
+
+        let mut res = Response::new();
+        res.body(ResBody::Once(Bytes::from_static(b"cached")));
+        // `res` does not carry `x-default`, i.e. the handler dropped it.
+        assert!(cached_response(&res, &before, false).is_none());
+        assert!(cached_response(&res, &before, true).is_none());
+
+        // Sanity: with no pre-cache header to drop, the same response caches.
+        assert!(cached_response(&res, &HeaderMap::new(), false).is_some());
+    }
+
+    #[test]
+    fn handler_response_headers_includes_handler_overrides() {
+        // CORS `CallNext::After` writes a default before the handler runs; the
+        // handler overwrites it. The overridden value must be cached so hits
+        // reproduce it instead of the pre-cache default.
+        let mut before = HeaderMap::new();
+        before.insert(
+            "access-control-allow-origin",
+            "https://default.example".parse().unwrap(),
+        );
+        let mut after = HeaderMap::new();
+        after.insert(
+            "access-control-allow-origin",
+            "https://handler.example".parse().unwrap(),
+        );
+
+        let stored = handler_response_headers(&before, &after);
+        assert_eq!(
+            stored.get("access-control-allow-origin").unwrap(),
+            "https://handler.example"
+        );
+    }
+
+    #[test]
+    fn respond_from_cache_overrides_handler_headers_but_keeps_outer() {
+        // The entry only carries handler-produced headers. On a hit they must
+        // override same-named pre-cache defaults, while outer headers absent
+        // from the entry (a fresh per-request `x-request-id`) are preserved.
+        let mut entry_headers = HeaderMap::new();
+        entry_headers.insert(
+            "access-control-allow-origin",
+            "https://handler.example".parse().unwrap(),
+        );
+        entry_headers.insert("content-type", "text/plain".parse().unwrap());
+        let entry = CachedEntry::new(
+            Some(StatusCode::OK),
+            entry_headers,
+            CachedBody::Once(Bytes::from_static(b"cached")),
+        );
+
+        let mut res = Response::new();
+        res.headers_mut()
+            .insert("x-request-id", "fresh-for-this-request".parse().unwrap());
+        res.headers_mut().insert(
+            "access-control-allow-origin",
+            "https://default.example".parse().unwrap(),
+        );
+
+        respond_from_cache(&mut res, entry);
+
+        assert_eq!(
+            res.headers().get("x-request-id").unwrap(),
+            "fresh-for-this-request"
+        );
+        assert_eq!(
+            res.headers().get("access-control-allow-origin").unwrap(),
+            "https://handler.example"
+        );
+        assert_eq!(res.headers().get("content-type").unwrap(), "text/plain");
+    }
+
+    #[test]
+    fn respond_from_cache_restores_multi_valued_headers() {
+        let mut cached_headers = HeaderMap::new();
+        cached_headers.append(SET_COOKIE, "a=1".parse().unwrap());
+        cached_headers.append(SET_COOKIE, "b=2".parse().unwrap());
+        let entry = CachedEntry::new(Some(StatusCode::OK), cached_headers, CachedBody::None);
+
+        let mut res = Response::new();
+        respond_from_cache(&mut res, entry);
+
+        let cookies: Vec<_> = res
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(cookies, vec!["a=1", "b=2"]);
+    }
+
+    #[test]
     fn test_cached_entry_clone() {
         let entry = CachedEntry::new(
             Some(StatusCode::OK),
@@ -926,6 +1322,97 @@ mod tests {
     fn test_cache_new() {
         let cache = Cache::new(MokaStore::<String>::new(100), RequestIssuer::default());
         assert!(format!("{cache:?}").contains("Cache"));
+    }
+
+    #[test]
+    fn in_flight_limit_bypasses_new_keys_when_full() {
+        let in_flight = Arc::new(InFlight::new(1));
+        let FlightPermit::Leader(first) = in_flight.enter("a") else {
+            panic!("first key should lead an in-flight request");
+        };
+
+        assert!(matches!(in_flight.enter("a"), FlightPermit::Follower(_)));
+        assert!(matches!(in_flight.enter("b"), FlightPermit::Bypass));
+
+        drop(first);
+        assert!(matches!(in_flight.enter("b"), FlightPermit::Leader(_)));
+    }
+
+    #[test]
+    fn cache_max_in_flight_can_disable_coalescing() {
+        let cache =
+            Cache::new(MokaStore::<String>::new(100), RequestIssuer::default()).max_in_flight(0);
+
+        assert!(matches!(
+            cache.in_flight.enter("uncached".to_owned()),
+            FlightPermit::Bypass
+        ));
+    }
+
+    #[test]
+    fn cached_response_skips_private_cache_headers_by_default() {
+        // Privacy heuristics only restrict a *shared* cache; a private cache
+        // (`cache_private(true)`) may still store these.
+        for (name, value) in [(SET_COOKIE, "sid=abc"), (CACHE_CONTROL, "private")] {
+            let mut res = Response::new();
+            res.body(ResBody::Once(Bytes::from_static(b"cached")));
+            res.headers_mut().insert(name, value.parse().unwrap());
+            assert!(cached_response(&res, &HeaderMap::new(), false).is_none());
+            assert!(cached_response(&res, &HeaderMap::new(), true).is_some());
+        }
+    }
+
+    #[test]
+    fn cached_response_never_stores_vary() {
+        // The store never folds the varied request headers into the key, so a
+        // `Vary` response cannot be told apart from another representation and is
+        // not cached in either mode (otherwise one client's representation would be
+        // replayed to clients that negotiated differently).
+        let mut res = Response::new();
+        res.body(ResBody::Once(Bytes::from_static(b"cached")));
+        res.headers_mut()
+            .insert(VARY, "accept-language".parse().unwrap());
+        assert!(cached_response(&res, &HeaderMap::new(), false).is_none());
+        assert!(cached_response(&res, &HeaderMap::new(), true).is_none());
+    }
+
+    #[test]
+    fn cached_response_never_stores_no_store_or_no_cache() {
+        // `no-store`/`no-cache` forbid caching in any cache, so they must be
+        // honored even in private-cache mode.
+        for value in ["max-age=60, no-store", "no-cache", "public, no-cache"] {
+            let mut res = Response::new();
+            res.body(ResBody::Once(Bytes::from_static(b"cached")));
+            res.headers_mut()
+                .insert(CACHE_CONTROL, value.parse().unwrap());
+            assert!(cached_response(&res, &HeaderMap::new(), false).is_none());
+            assert!(cached_response(&res, &HeaderMap::new(), true).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_requests_are_not_cached_by_default() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cache = Cache::new(
+            MokaStore::builder()
+                .time_to_live(std::time::Duration::from_secs(60))
+                .build(),
+            RequestIssuer::default(),
+        );
+        let router = Arc::new(Router::new().hoop(cache).goal(SlowCached {
+            calls: calls.clone(),
+        }));
+
+        for _ in 0..2 {
+            let mut res = TestClient::get("http://127.0.0.1:5801")
+                .add_header(AUTHORIZATION, "Bearer token", true)
+                .send(router.clone())
+                .await;
+            assert_eq!(res.status_code, Some(StatusCode::OK));
+            let _ = res.take_string().await.unwrap();
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

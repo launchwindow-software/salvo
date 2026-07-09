@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 //! Automatic HTTPS/TLS certificate management for Salvo via the ACME protocol.
 //!
@@ -11,8 +12,15 @@
 //! - **On-demand TLS**: obtain certificates at handshake time.
 //! - **OCSP stapling**: automatic OCSP response fetching and stapling.
 //! - **Multiple key types**: ECDSA P-256/P-384/P-521, RSA, Ed25519.
-//! - **Persistent storage**: pluggable storage backend via [`certon::Storage`].
+//! - **Persistent storage**: pluggable storage backend via [`Storage`].
 //! - **Background renewal**: automatic certificate renewal and OCSP refresh.
+//!
+//! ## Certificate key type
+//!
+//! Salvo ACME defaults to [`KeyType::EcdsaP256`] for newly generated
+//! certificate private keys. RSA key types remain available for compatibility,
+//! but they are explicit opt-in via [`AcmeConfigBuilder::key_type`] or
+//! [`AcmeListenerBuilder::key_type`].
 //!
 //! ## Quick Start - HTTP-01
 //!
@@ -61,8 +69,7 @@
 //! }
 //! ```
 
-#[macro_use]
-mod cfg;
+use salvo_core::cfg_feature;
 
 mod config;
 mod listener;
@@ -93,20 +100,14 @@ pub use certon::{
     AcmeIssuer, AcmeIssuerBuilder, CertCache, CertIssuer, CertResolver, Certificate,
     Config as CertonConfig, ConfigBuilder as CertonConfigBuilder, DistributedSolver, Dns01Solver,
     DnsProvider, FileStorage, Http01Solver, IssuedCertificate, IssuerPolicy, KeyType,
-    MaintenanceConfig, Manager, OcspConfig, OnDemandConfig, PreChecker, Revoker, Solver, Storage,
-    TlsAlpn01Solver, ZeroSslIssuer,
+    LETS_ENCRYPT_PRODUCTION, LETS_ENCRYPT_STAGING, MaintenanceConfig, Manager, OcspConfig,
+    OnDemandConfig, PreChecker, Revoker, Solver, Storage, TlsAlpn01Solver, ZEROSSL_PRODUCTION,
+    ZeroSslIssuer,
 };
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Let's Encrypt production directory URL.
-pub const LETS_ENCRYPT_PRODUCTION: &str = certon::LETS_ENCRYPT_PRODUCTION;
-/// Let's Encrypt staging directory URL.
-pub const LETS_ENCRYPT_STAGING: &str = certon::LETS_ENCRYPT_STAGING;
-/// ZeroSSL production directory URL.
-pub const ZEROSSL_PRODUCTION: &str = certon::ZEROSSL_PRODUCTION;
 
 /// Well known ACME challenge path.
 pub(crate) const WELL_KNOWN_PATH: &str = "/.well-known/acme-challenge";
@@ -171,8 +172,14 @@ impl Handler for Http01Handler {
                 return;
             }
 
-            tracing::error!(token, "key not found for ACME challenge token");
-            res.render(token);
+            // Log only the length, not the token itself, so log/APM/SIEM
+            // pipelines do not become a credential surface for the ACME
+            // challenge flow.
+            tracing::error!(
+                token_len = token.len(),
+                "key not found for ACME challenge token"
+            );
+            res.render(StatusError::not_found().brief("challenge token not found"));
         } else {
             res.render(StatusError::not_found().brief("missing token"));
         }
@@ -193,5 +200,45 @@ where
 {
     fn acme(self) -> AcmeListenerBuilder<Self> {
         AcmeListenerBuilder::new(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use salvo_core::http::StatusCode;
+    use salvo_core::prelude::*;
+    use salvo_core::test::{ResponseExt, TestClient};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn http01_handler_serves_known_token() {
+        let keys = Arc::new(RwLock::new(HashMap::from([(
+            "known".to_owned(),
+            "key-authorization".to_owned(),
+        )])));
+        let handler = Http01Handler { keys };
+        let router = Router::with_path(format!("{WELL_KNOWN_PATH}/{{token}}")).goal(handler);
+
+        let mut response = TestClient::get("http://127.0.0.1/.well-known/acme-challenge/known")
+            .send(router)
+            .await;
+
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        assert_eq!(response.take_string().await.unwrap(), "key-authorization");
+    }
+
+    #[tokio::test]
+    async fn http01_handler_rejects_unknown_token() {
+        let handler = Http01Handler {
+            keys: Arc::new(RwLock::new(HashMap::new())),
+        };
+        let router = Router::with_path(format!("{WELL_KNOWN_PATH}/{{token}}")).goal(handler);
+
+        let response = TestClient::get("http://127.0.0.1/.well-known/acme-challenge/unknown")
+            .send(router)
+            .await;
+
+        assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
     }
 }

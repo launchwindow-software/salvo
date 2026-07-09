@@ -59,12 +59,14 @@ use http::uri::Scheme;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_util::sync::CancellationToken;
 
-use crate::fuse::{ArcFuseFactory, ArcFusewire};
+use crate::fuse::{ArcFusePolicy, FuseConfig};
 use crate::http::Version;
 use crate::service::HyperHandler;
 
 mod proto;
 pub use proto::HttpBuilder;
+mod ctrl;
+pub use ctrl::ConnCtrl;
 mod stream;
 pub use stream::*;
 
@@ -171,7 +173,7 @@ pub trait IntoConfigStream<C> {
 /// - The raw connection stream for reading/writing data
 /// - Local and remote socket addresses for logging and access control
 /// - HTTP scheme (http/https) for proper URL construction
-/// - Optional fusewire for connection lifecycle management
+/// - Optional fuse_config for connection lifecycle management
 pub struct Accepted<C, S>
 where
     C: Coupler<Stream = S>,
@@ -185,11 +187,16 @@ where
     ///
     /// This is the raw stream that will be used for reading requests and writing responses.
     pub stream: S,
-    /// Optional fusewire for connection protection and monitoring.
+    /// Optional fuse_config for connection protection and monitoring.
     ///
     /// When set, this allows the connection to be monitored for slow HTTP attacks
     /// and other malicious behavior patterns.
-    pub fusewire: Option<ArcFusewire>,
+    pub fuse_config: Option<FuseConfig>,
+    /// Lifecycle control for this connection.
+    ///
+    /// Created when the connection is accepted and shared with its stream, protocol driver,
+    /// and handlers so any of them can abort, gracefully shut down, or relax the fuse timers.
+    pub conn_ctrl: ConnCtrl,
     /// The local address this connection was accepted on.
     ///
     /// Useful for multi-homed servers or logging purposes.
@@ -236,7 +243,8 @@ where
         let Self {
             coupler,
             stream,
-            fusewire,
+            fuse_config,
+            conn_ctrl,
             local_addr,
             remote_addr,
             http_scheme,
@@ -244,7 +252,8 @@ where
         Accepted {
             coupler: coupler_fn(coupler),
             stream: stream_fn(stream),
-            fusewire,
+            fuse_config,
+            conn_ctrl,
             local_addr,
             remote_addr,
             http_scheme,
@@ -300,7 +309,7 @@ pub trait Acceptor: Send {
     ///
     /// # Parameters
     ///
-    /// - `fuse_factory`: Optional factory for creating fusewires to protect against slow HTTP
+    /// - `fuse_policy`: Optional factory for creating fuse_configs to protect against slow HTTP
     ///   attacks and other malicious patterns
     ///
     /// # Errors
@@ -308,7 +317,7 @@ pub trait Acceptor: Send {
     /// Returns an I/O error if the connection cannot be accepted.
     fn accept(
         &mut self,
-        fuse_factory: Option<ArcFuseFactory>,
+        fuse_policy: Option<ArcFusePolicy>,
     ) -> impl Future<Output = IoResult<Accepted<Self::Coupler, Self::Stream>>> + Send;
 }
 
@@ -340,13 +349,17 @@ pub struct Holding {
 }
 impl Display for Holding {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:?} on {}://{}",
-            self.http_versions,
-            self.http_scheme,
-            self.local_addr.to_string().trim_start_matches("socket://")
-        )
+        write!(f, "{:?} on ", self.http_versions)?;
+        let addr = self.local_addr.to_string();
+        // IPv4/IPv6 addresses render as `socket://<addr>`; replace that placeholder
+        // scheme with the real HTTP scheme. Other kinds (e.g. a Unix socket's
+        // `unix://<path>`) already carry a meaningful prefix and the HTTP scheme
+        // does not apply, so they are shown verbatim — the old code produced
+        // `https://unix://...`.
+        match addr.strip_prefix("socket://") {
+            Some(rest) => write!(f, "{}://{}", self.http_scheme, rest),
+            None => f.write_str(&addr),
+        }
     }
 }
 /// A trait for coupling streams with HTTP protocol handling.
@@ -540,5 +553,29 @@ impl AsyncWrite for DynStream {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<IoResult<()>> {
         let this = &mut *self;
         Pin::new(&mut this.writer).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn holding_display_scheme_handling() {
+        let ip = Holding {
+            local_addr: SocketAddr::from("127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap()),
+            http_versions: vec![],
+            http_scheme: Scheme::HTTP,
+        };
+        assert_eq!(ip.to_string(), "[] on http://127.0.0.1:8080");
+
+        // A non-IP address (here `Unknown`, same path a `unix://` socket takes)
+        // must not be prefixed with a bogus `http://`.
+        let other = Holding {
+            local_addr: SocketAddr::Unknown,
+            http_versions: vec![],
+            http_scheme: Scheme::HTTP,
+        };
+        assert_eq!(other.to_string(), "[] on unknown");
     }
 }

@@ -5,7 +5,7 @@ Macro accepts set of attributes that can be used to configure and override defau
 You can use the Rust's own `#[deprecated]` attribute on functions to mark it as deprecated and it will
 reflect to the generated OpenAPI spec. Only **parameters** has a special **deprecated** attribute to define them as deprecated.
 
-`#[deprecated]` attribute supports adding additional details such as a reason and or since version but this is not supported in
+`#[deprecated]` attribute supports adding additional details such as a reason or the `since` version, but this is not supported in
 OpenAPI. OpenAPI has only a boolean flag to determine deprecation. While it is totally okay to declare deprecated with reason
 `#[deprecated  = "There is better way to do this"]` the reason would not render in OpenAPI spec.
 
@@ -21,6 +21,14 @@ fn endpoint() {}
 ```
 
 # Endpoint Attributes
+
+If the unqualified attribute name conflicts with another crate, use a fully qualified path such as
+`#[salvo_oapi::endpoint(...)]` or `#[salvo::oapi::endpoint(...)]`.
+
+The plural list attributes remain supported. For codebases that prefer one item per attribute,
+the following singular aliases are accepted as well: `tag(...)` for `tags(...)`, `parameter(...)`
+for `parameters(...)`, `response(...)` for `responses(...)`, and `status_code(...)` for
+`status_codes(...)`.
 
 * `operation_id = ...` Unique operation id for the endpoint. By default this is mapped to function name.
   The operation_id can be any "valid expression (e.g. string literals, macro invocations, variables) so long

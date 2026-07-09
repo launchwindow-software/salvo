@@ -91,7 +91,7 @@ impl Handler for MaxConcurrency {
         ctrl: &mut FlowCtrl,
     ) {
         match self.semaphore.try_acquire() {
-            Ok(_) => {
+            Ok(_permit) => {
                 ctrl.call_next(req, depot, res).await;
             }
             Err(e) => match e {
@@ -100,10 +100,14 @@ impl Handler for MaxConcurrency {
                         "Max concurrency semaphore is never closed, acquire should never fail: {}",
                         e
                     );
-                    res.render(StatusError::payload_too_large().brief("max concurrency reached"));
+                    res.render(
+                        StatusError::service_unavailable().brief("max concurrency reached"),
+                    );
                 }
                 TryAcquireError::NoPermits => {
-                    tracing::error!("no permits: {}", e);
+                    // Hitting the concurrency limit is an expected condition, not
+                    // an error; log it at debug level to avoid log spam.
+                    tracing::debug!("max concurrency reached, rejecting request");
                     res.render(StatusError::too_many_requests().brief("max concurrency reached"));
                 }
             },
@@ -118,3 +122,63 @@ impl Handler for MaxConcurrency {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::Notify;
+
+    use salvo_core::http::StatusCode;
+    use salvo_core::prelude::*;
+    use salvo_core::test::TestClient;
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct BlockingHandler {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Handler for BlockingHandler {
+        async fn handle(
+            &self,
+            _req: &mut Request,
+            _depot: &mut Depot,
+            res: &mut Response,
+            _ctrl: &mut FlowCtrl,
+        ) {
+            self.started.notify_one();
+            self.release.notified().await;
+            res.render("done");
+        }
+    }
+
+    #[tokio::test]
+    async fn max_concurrency_holds_permit_until_next_handler_finishes() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let router = Arc::new(Router::new().hoop(max_concurrency(1)).get(BlockingHandler {
+            started: started.clone(),
+            release: release.clone(),
+        }));
+
+        let first_router = router.clone();
+        let first = tokio::spawn(async move {
+            TestClient::get("http://127.0.0.1:5801")
+                .send(first_router)
+                .await
+        });
+        started.notified().await;
+
+        let second = TestClient::get("http://127.0.0.1:5801")
+            .send(router)
+            .await;
+        assert_eq!(second.status_code, Some(StatusCode::TOO_MANY_REQUESTS));
+
+        release.notify_one();
+        let first = first.await.unwrap();
+        assert_eq!(first.status_code, Some(StatusCode::OK));
+    }
+}

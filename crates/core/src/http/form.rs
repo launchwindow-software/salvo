@@ -1,6 +1,5 @@
 //! Form parse module.
 use std::ffi::OsStr;
-use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
 use base64::engine::Engine;
@@ -32,7 +31,7 @@ pub struct FormData {
 }
 
 impl FormData {
-    /// Create new `FormData`.
+    /// Creates a new `FormData`.
     #[inline]
     #[must_use]
     pub fn new() -> Self {
@@ -49,12 +48,12 @@ impl FormData {
         O: Into<Bytes> + 'static,
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        let ctype: Option<Mime> = headers
+        let content_type: Option<Mime> = headers
             .get(CONTENT_TYPE)
             .and_then(|h| h.to_str().ok())
             .and_then(|v| v.parse().ok());
-        match ctype {
-            Some(ctype) if ctype.subtype() == mime::WWW_FORM_URLENCODED => {
+        match content_type {
+            Some(content_type) if content_type.subtype() == mime::WWW_FORM_URLENCODED => {
                 futures_util::pin_mut!(body);
                 let mut data = BytesMut::new();
                 while let Some(chunk) = body.try_next().await.map_err(|e| {
@@ -71,33 +70,34 @@ impl FormData {
                 form_data.fields = form_urlencoded::parse(&data).into_owned().collect();
                 Ok(form_data)
             }
-            Some(ctype) if ctype.type_() == mime::MULTIPART => {
+            Some(content_type) if content_type.type_() == mime::MULTIPART => {
                 let mut form_data = Self::new();
-                if let Some(boundary) = headers
+                let Some(boundary) = headers
                     .get(CONTENT_TYPE)
                     .and_then(|ct| ct.to_str().ok())
                     .and_then(|ct| multra::parse_boundary(ct).ok())
-                {
-                    let mut multipart = Multipart::new(body, boundary);
-                    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
-                        // Check if the multra error contains a LengthLimitError
-                        let mut source = std::error::Error::source(&e);
-                        while let Some(err) = source {
-                            if err.is::<http_body_util::LengthLimitError>() {
-                                return ParseError::PayloadTooLarge;
-                            }
-                            source = std::error::Error::source(err);
+                else {
+                    return Err(ParseError::InvalidContentType);
+                };
+                let mut multipart = Multipart::new(body, boundary);
+                while let Some(mut field) = multipart.next_field().await.map_err(|e| {
+                    // Check if the multra error contains a LengthLimitError
+                    let mut source = std::error::Error::source(&e);
+                    while let Some(err) = source {
+                        if err.is::<http_body_util::LengthLimitError>() {
+                            return ParseError::PayloadTooLarge;
                         }
-                        ParseError::Multer(e)
-                    })? {
-                        if let Some(name) = field.name().map(|s| s.to_owned()) {
-                            if field.headers().get(CONTENT_TYPE).is_some() {
-                                form_data
-                                    .files
-                                    .insert(name, FilePart::create(&mut field).await?);
-                            } else {
-                                form_data.fields.insert(name, field.text().await?);
-                            }
+                        source = std::error::Error::source(err);
+                    }
+                    ParseError::Multer(e)
+                })? {
+                    if let Some(name) = field.name().map(|s| s.to_owned()) {
+                        if field.file_name().is_some() {
+                            form_data
+                                .files
+                                .insert(name, FilePart::create(&mut field).await?);
+                        } else {
+                            form_data.fields.insert(name, field.text().await?);
                         }
                     }
                 }
@@ -179,12 +179,33 @@ impl FilePart {
 
     /// Create a new temporary FilePart (when created this way, the file will be
     /// deleted once the FilePart object goes out of scope).
+    ///
+    /// # Security
+    ///
+    /// This streams the entire field to a temporary file with **no size limit
+    /// of its own** — it writes until the field ends. When the body is read for
+    /// the first time through
+    /// [`Request::form_data`](crate::http::Request::form_data) it is bounded by
+    /// the request's secure-max-size limit (configurable via
+    /// [`Request::set_secure_max_size`](crate::http::Request::set_secure_max_size),
+    /// the [`set_global_secure_max_size`](crate::http::request::set_global_secure_max_size)
+    /// default, or the `SecureMaxSize` middleware).
+    ///
+    /// That guarantee only covers the **first** read of the body: if the body
+    /// was already consumed and cached by an earlier `payload`/`payload_with_max_size`
+    /// call (possibly under a larger limit or none), `form_data` reuses the
+    /// cached payload without re-applying the limit. In that case, or when
+    /// calling `create` directly on an otherwise unbounded `Field`, a client can
+    /// fill the temporary directory's disk (denial of service), so make sure the
+    /// request body is bounded before the first read.
     pub async fn create(field: &mut Field<'_>) -> Result<Self, ParseError> {
         // Setup a file to capture the contents.
+        // Map the `JoinError` to a `ParseError` instead of panicking, so a
+        // runtime issue (e.g. shutdown) on this request path doesn't abort.
         let mut path =
             tokio::task::spawn_blocking(|| Builder::new().prefix("salvo_http_multipart").tempdir())
                 .await
-                .expect("Runtime spawn blocking poll error")?
+                .map_err(ParseError::other)??
                 .keep();
         let temp_dir = Some(path.clone());
         let name = field.file_name().map(|s| {
@@ -221,34 +242,40 @@ impl FilePart {
         })
     }
 }
+
+fn cleanup_temporary_upload(path: &Path, temp_dir: &Path) {
+    // Log warnings if cleanup fails to help identify potential disk space issues.
+    if let Err(e) = std::fs::remove_file(path) {
+        // Only log if the file still exists (ENOENT is expected if already cleaned up).
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "failed to remove temporary upload file"
+            );
+        }
+    }
+    if let Err(e) = std::fs::remove_dir(temp_dir) {
+        // Only log if directory still exists and is not empty.
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::debug!(
+                error = %e,
+                path = %temp_dir.display(),
+                "failed to remove temporary upload directory"
+            );
+        }
+    }
+}
+
 impl Drop for FilePart {
     fn drop(&mut self) {
-        if let Some(temp_dir) = &self.temp_dir {
+        if let Some(temp_dir) = self.temp_dir.take() {
             let path = self.path.clone();
-            let temp_dir = temp_dir.to_owned();
-            tokio::task::spawn_blocking(move || {
-                // Log warnings if cleanup fails to help identify potential disk space issues
-                if let Err(e) = std::fs::remove_file(&path) {
-                    // Only log if the file still exists (ENOENT is expected if already cleaned up)
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(
-                            error = %e,
-                            path = %path.display(),
-                            "failed to remove temporary upload file"
-                        );
-                    }
-                }
-                if let Err(e) = std::fs::remove_dir(&temp_dir) {
-                    // Only log if directory still exists and is not empty
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::debug!(
-                            error = %e,
-                            path = %temp_dir.display(),
-                            "failed to remove temporary upload directory"
-                        );
-                    }
-                }
-            });
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::spawn_blocking(move || cleanup_temporary_upload(&path, &temp_dir));
+            } else {
+                cleanup_temporary_upload(&path, &temp_dir);
+            }
         }
     }
 }
@@ -256,27 +283,54 @@ impl Drop for FilePart {
 // Port from https://github.com/mikedilger/textnonce/blob/master/src/lib.rs
 fn text_nonce() -> String {
     const BYTE_LEN: usize = 24;
-    let mut raw: Vec<u8> = vec![0; BYTE_LEN];
+    let mut raw = [0u8; BYTE_LEN];
 
-    // Get the first 12 bytes from the current time
+    // First 12 bytes are derived from a monotonically advancing time source so
+    // that nonce values issued within the same process tend to differ even on
+    // RNG failure; the trailing 12 bytes are pure CSPRNG output. If the RNG
+    // fails (extremely rare), we fall back to a wider time window so we still
+    // emit a valid nonce instead of panicking.
     if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        let secs: u64 = now.as_secs();
-        let nsecs: u32 = now.subsec_nanos();
-
-        let mut cursor = Cursor::new(&mut *raw);
-        Write::write_all(&mut cursor, &nsecs.to_le_bytes()).expect("write_all failed");
-        Write::write_all(&mut cursor, &secs.to_le_bytes()).expect("write_all failed");
-
-        // Get the last bytes from random data
-        SysRng
-            .try_fill_bytes(&mut raw[12..BYTE_LEN])
-            .expect("SysRng.try_fill_bytes failed");
-    } else {
-        SysRng
-            .try_fill_bytes(&mut raw[..])
-            .expect("SysRng.try_fill_bytes failed");
+        raw[..4].copy_from_slice(&now.subsec_nanos().to_le_bytes());
+        raw[4..12].copy_from_slice(&now.as_secs().to_le_bytes());
+    }
+    if SysRng.try_fill_bytes(&mut raw[12..]).is_err() {
+        let micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or_default();
+        raw[12..20].copy_from_slice(&micros.to_le_bytes());
+        raw[20..].copy_from_slice(&micros.rotate_left(17).to_le_bytes()[..4]);
     }
 
-    // base64 encode
-    URL_SAFE_NO_PAD.encode(&raw)
+    URL_SAFE_NO_PAD.encode(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_part_drop_removes_temp_files_without_tokio_runtime() {
+        let temp_dir = Builder::new()
+            .prefix("salvo_http_multipart_drop_test")
+            .tempdir()
+            .expect("create temp dir")
+            .keep();
+        let path = temp_dir.join("upload.tmp");
+        std::fs::write(&path, b"data").expect("write temp upload");
+
+        {
+            let _file_part = FilePart {
+                name: None,
+                headers: HeaderMap::new(),
+                path: path.clone(),
+                size: 4,
+                temp_dir: Some(temp_dir.clone()),
+            };
+        }
+
+        assert!(!path.exists());
+        assert!(!temp_dir.exists());
+    }
 }

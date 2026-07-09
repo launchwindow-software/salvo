@@ -17,7 +17,13 @@
 //! # Built-in Implementations
 //!
 //! ## Issuers
-//! - [`RemoteIpIssuer`]: Identifies clients by IP address
+//! - [`RemoteIpIssuer`]: Identifies clients by their direct connection IP
+//! - [`TrustedProxyIssuer`]: Honours `X-Forwarded-For` / `X-Real-IP` only when the request actually
+//!   arrived from a configured proxy IP. **This is the safe choice for deployments behind a reverse
+//!   proxy.**
+//! - `ForwardedHeaderIssuer` (deprecated): Unconditionally trusts the forwarded headers, so a
+//!   client that reaches the application directly can spoof its IP and bypass rate limiting — use
+//!   [`TrustedProxyIssuer`] instead.
 //!
 //! ## Guards (Algorithms)
 //! - `FixedGuard`: Fixed window algorithm (requires `fixed-guard` feature)
@@ -91,6 +97,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt::{self, Debug, Formatter};
 use std::hash::Hash;
@@ -102,8 +109,7 @@ use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
 
 mod quota;
 pub use quota::{BasicQuota, CelledQuota, QuotaGetter};
-#[macro_use]
-mod cfg;
+use salvo_core::cfg_feature;
 
 cfg_feature! {
     #![feature = "moka-store"]
@@ -126,11 +132,17 @@ cfg_feature! {
     pub use sliding_guard::SlidingGuard;
 }
 
-/// Issuer is used to identify every request.
+/// Issues a rate-limit key for a request, identifying the subject being limited.
 pub trait RateIssuer: Send + Sync + 'static {
-    /// The key is used to identify the rate limit.
+    /// The key type that uniquely identifies a rate-limited subject (e.g. client IP, user id).
     type Key: Hash + Eq + Send + Sync + 'static;
-    /// Issue a new key for the request.
+    /// Issue a key identifying the rate-limited subject for this request.
+    ///
+    /// Returning `None` means the subject could not be identified: the
+    /// [`RateLimiter`] handler then rejects the request with `400 Bad Request`
+    /// (`"invalid identifier"`) and skips the rest of the chain. It does **not**
+    /// let the request through unlimited, so an issuer that wants to exempt
+    /// certain requests should pair the limiter with a [`Skipper`] instead.
     fn issue(
         &self,
         req: &mut Request,
@@ -144,7 +156,7 @@ where
 {
     type Key = K;
     async fn issue(&self, req: &mut Request, depot: &Depot) -> Option<Self::Key> {
-        (self)(req, depot)
+        self(req, depot)
     }
 }
 
@@ -156,11 +168,10 @@ where
 /// connection. When your application is behind a reverse proxy or load balancer,
 /// this will be the proxy's IP, not the client's real IP.
 ///
-/// For applications behind proxies, use [`RealIpIssuer`] instead, which can
-/// extract the client IP from headers like `X-Forwarded-For` or `X-Real-IP`.
-///
-/// **Warning**: Never use `RealIpIssuer` without a trusted proxy, as clients
-/// can forge these headers to bypass rate limiting.
+/// For applications behind proxies, use [`TrustedProxyIssuer`] instead, which
+/// extracts the client IP from headers like `X-Forwarded-For` or `X-Real-IP`,
+/// but only when the request actually arrived from a configured proxy address —
+/// so those headers cannot be forged by clients connecting directly.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RemoteIpIssuer;
 impl RateIssuer for RemoteIpIssuer {
@@ -170,17 +181,16 @@ impl RateIssuer for RemoteIpIssuer {
     }
 }
 
-/// Identify user by their real IP address, supporting proxy headers.
+/// Identifies a client by an IP extracted from forwarded-header trust, in this
+/// order:
 ///
-/// This issuer attempts to extract the client's real IP address by checking
-/// headers in the following order:
-/// 1. `X-Forwarded-For` (first IP in the list)
+/// 1. `X-Forwarded-For` (first entry in the comma-separated list)
 /// 2. `X-Real-IP`
-/// 3. Falls back to `remote_addr()` if no headers are present
+/// 3. Falls back to `remote_addr()` if neither header is present
 ///
 /// # Security Warning
 ///
-/// **Only use this issuer when your application is behind a TRUSTED proxy!**
+/// **Only use this issuer when your application is behind a TRUSTED proxy.**
 ///
 /// If clients can connect directly to your application (bypassing the proxy),
 /// they can forge these headers to:
@@ -191,23 +201,25 @@ impl RateIssuer for RemoteIpIssuer {
 /// - Overwrite (not append to) the `X-Forwarded-For` header
 /// - Block direct connections to your application
 ///
-/// # Example
+/// For deployments that might also accept direct connections, use
+/// [`TrustedProxyIssuer`] instead — it only honours the forwarded headers when
+/// the request actually arrived from a configured proxy address.
 ///
-/// ```ignore
-/// use salvo_rate_limiter::{RateLimiter, RealIpIssuer, BasicQuota, FixedGuard, MokaStore};
-///
-/// let limiter = RateLimiter::new(
-///     FixedGuard::default(),
-///     MokaStore::default(),
-///     RealIpIssuer::new(),
-///     BasicQuota::per_minute(100),
-/// );
-/// ```
+/// Migrating: [`TrustedProxyIssuer::new`] takes the set of proxy addresses your
+/// deployment actually uses, e.g.
+/// `TrustedProxyIssuer::new(["10.0.0.1".parse::<IpAddr>().unwrap()])`.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct RealIpIssuer;
+#[deprecated(
+    since = "0.94.0",
+    note = "unconditionally trusts client-controlled forwarded headers, letting direct \
+            connections spoof their IP and bypass rate limiting; use `TrustedProxyIssuer` \
+            (verifies the request came from a configured proxy) or `RemoteIpIssuer` instead"
+)]
+pub struct ForwardedHeaderIssuer;
 
-impl RealIpIssuer {
-    /// Create a new `RealIpIssuer`.
+#[allow(deprecated)]
+impl ForwardedHeaderIssuer {
+    /// Create a new `ForwardedHeaderIssuer`.
     #[inline]
     #[must_use]
     pub fn new() -> Self {
@@ -215,34 +227,156 @@ impl RealIpIssuer {
     }
 }
 
-impl RateIssuer for RealIpIssuer {
+#[allow(deprecated)]
+impl RateIssuer for ForwardedHeaderIssuer {
     type Key = IpAddr;
 
     async fn issue(&self, req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
-        // Try X-Forwarded-For header first (common with most reverse proxies)
-        if let Some(xff) = req.headers().get("x-forwarded-for")
-            && let Ok(xff_str) = xff.to_str()
+        extract_forwarded_ip(req).or_else(|| req.remote_addr().ip())
+    }
+}
+
+/// Identify the client IP only when the request arrived from a trusted proxy.
+///
+/// `TrustedProxyIssuer` is the proxy-aware counterpart to [`ForwardedHeaderIssuer`].
+/// It consults `X-Forwarded-For` and `X-Real-IP` **only** when the direct
+/// connection IP (`req.remote_addr()`) matches one of the trusted proxy
+/// addresses supplied at construction time. For requests coming from any
+/// other source it ignores those headers and returns the direct connection
+/// IP, so a client that connects to the application directly cannot forge
+/// `X-Forwarded-For` to bypass rate limiting.
+///
+/// # When to use it
+///
+/// - Your application is normally reachable only through a reverse proxy / load balancer (nginx,
+///   Cloudflare, ELB, etc.), and that proxy rewrites the forwarded headers.
+/// - You cannot guarantee that **direct** connections to the application are impossible — for
+///   example a developer port-forward, a misrouted firewall rule, or a cloud security-group
+///   regression would briefly expose it. With [`ForwardedHeaderIssuer`] those direct connections
+///   would let any client spoof their source IP; with `TrustedProxyIssuer` the spoofed header is
+///   silently ignored.
+///
+/// # Example
+///
+/// ```ignore
+/// use std::net::IpAddr;
+/// use salvo_rate_limiter::{RateLimiter, TrustedProxyIssuer, BasicQuota, FixedGuard, MokaStore};
+///
+/// let limiter = RateLimiter::new(
+///     FixedGuard::default(),
+///     MokaStore::default(),
+///     TrustedProxyIssuer::new([
+///         "10.0.0.5".parse::<IpAddr>().unwrap(),
+///         "10.0.0.6".parse::<IpAddr>().unwrap(),
+///     ]),
+///     BasicQuota::per_minute(100),
+/// );
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct TrustedProxyIssuer {
+    trusted_proxies: HashSet<IpAddr>,
+}
+
+impl TrustedProxyIssuer {
+    /// Create a `TrustedProxyIssuer` that only honours forwarded headers
+    /// for requests coming from one of the given proxy addresses.
+    ///
+    /// An empty proxy list makes the issuer behave like [`RemoteIpIssuer`] —
+    /// no header is ever trusted.
+    #[must_use]
+    pub fn new<I, A>(trusted_proxies: I) -> Self
+    where
+        I: IntoIterator<Item = A>,
+        A: Into<IpAddr>,
+    {
+        Self {
+            trusted_proxies: trusted_proxies.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Returns true if the given IP is one of the configured proxies.
+    #[must_use]
+    pub fn is_trusted(&self, addr: &IpAddr) -> bool {
+        self.trusted_proxies.contains(addr)
+    }
+}
+
+impl RateIssuer for TrustedProxyIssuer {
+    type Key = IpAddr;
+
+    async fn issue(&self, req: &mut Request, _depot: &Depot) -> Option<Self::Key> {
+        let remote_ip = req.remote_addr().ip();
+        if let Some(remote_ip) = remote_ip
+            && self.trusted_proxies.contains(&remote_ip)
+            && let Some(forwarded) =
+                extract_client_ip_via_trusted_proxies(req, &self.trusted_proxies)
         {
-            // X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2"
-            // The first one is the original client IP
-            if let Some(first_ip) = xff_str.split(',').next()
-                && let Ok(ip) = first_ip.trim().parse::<IpAddr>()
+            return Some(forwarded);
+        }
+        remote_ip
+    }
+}
+
+/// Determine the real client IP for a request that arrived through a trusted proxy.
+///
+/// `X-Forwarded-For` is appended left-to-right (`client, proxy1, proxy2`), so the
+/// untrusted client address is found by scanning **right-to-left** and returning the
+/// first entry that is not itself a trusted proxy. Taking the leftmost value (as the
+/// legacy [`ForwardedHeaderIssuer`] does) would let a client spoof its address by
+/// pre-populating the header before it reaches the trusted proxy.
+fn extract_client_ip_via_trusted_proxies(
+    req: &Request,
+    trusted: &HashSet<IpAddr>,
+) -> Option<IpAddr> {
+    if let Some(xff) = req.headers().get("x-forwarded-for")
+        && let Ok(xff_str) = xff.to_str()
+    {
+        for part in xff_str.rsplit(',') {
+            if let Ok(ip) = part.trim().parse::<IpAddr>()
+                && !trusted.contains(&ip)
             {
                 return Some(ip);
             }
         }
+    }
 
-        // Try X-Real-IP header (used by nginx)
-        if let Some(real_ip) = req.headers().get("x-real-ip")
-            && let Ok(real_ip_str) = real_ip.to_str()
-            && let Ok(ip) = real_ip_str.trim().parse::<IpAddr>()
+    // No usable forwarded address; fall back to `X-Real-IP` set by the trusted proxy.
+    if let Some(real_ip) = req.headers().get("x-real-ip")
+        && let Ok(real_ip_str) = real_ip.to_str()
+        && let Ok(ip) = real_ip_str.trim().parse::<IpAddr>()
+    {
+        return Some(ip);
+    }
+
+    None
+}
+
+/// Parse the first usable IP out of `X-Forwarded-For` / `X-Real-IP`.
+///
+/// Returns `None` if neither header is present or parseable.
+fn extract_forwarded_ip(req: &Request) -> Option<IpAddr> {
+    // Try X-Forwarded-For header first (common with most reverse proxies)
+    if let Some(xff) = req.headers().get("x-forwarded-for")
+        && let Ok(xff_str) = xff.to_str()
+    {
+        // X-Forwarded-For can contain multiple IPs: "client, proxy1, proxy2"
+        // The first one is the original client IP
+        if let Some(first_ip) = xff_str.split(',').next()
+            && let Ok(ip) = first_ip.trim().parse::<IpAddr>()
         {
             return Some(ip);
         }
-
-        // Fall back to remote address
-        req.remote_addr().ip()
     }
+
+    // Try X-Real-IP header (used by nginx)
+    if let Some(real_ip) = req.headers().get("x-real-ip")
+        && let Ok(real_ip_str) = real_ip.to_str()
+        && let Ok(ip) = real_ip_str.trim().parse::<IpAddr>()
+    {
+        return Some(ip);
+    }
+
+    None
 }
 
 /// `RateGuard` is strategy to verify is the request exceeded quota
@@ -357,10 +491,10 @@ impl<G: RateGuard, S: RateStore, I: RateIssuer, P: QuotaGetter<I::Key>> RateLimi
         }
     }
 
-    /// Sets skipper and returns new `RateLimiter`.
+    /// Sets the [`Skipper`] used to bypass rate limiting for matching requests.
     #[inline]
     #[must_use]
-    pub fn with_skipper(mut self, skipper: impl Skipper) -> Self {
+    pub fn skipper(mut self, skipper: impl Skipper) -> Self {
         self.skipper = Box::new(skipper);
         self
     }
@@ -664,5 +798,99 @@ mod tests {
         let issuer = RemoteIpIssuer;
         let debug_str = format!("{issuer:?}");
         assert!(debug_str.contains("RemoteIpIssuer"));
+    }
+
+    // Tests for TrustedProxyIssuer
+
+    fn make_req_from_proxy(proxy_ip: &str, xff: Option<&str>, real_ip: Option<&str>) -> Request {
+        use std::net::SocketAddr as StdSocketAddr;
+
+        let mut req = TestClient::get("http://example.test/").build();
+        if let Some(xff) = xff {
+            req.headers_mut()
+                .insert("x-forwarded-for", xff.parse().unwrap());
+        }
+        if let Some(real_ip) = real_ip {
+            req.headers_mut()
+                .insert("x-real-ip", real_ip.parse().unwrap());
+        }
+        let proxy: StdSocketAddr = format!("{proxy_ip}:443").parse().unwrap();
+        *req.remote_addr_mut() = proxy.into();
+        req
+    }
+
+    #[tokio::test]
+    async fn test_trusted_proxy_issuer_ignores_xff_from_untrusted_remote() {
+        let issuer = TrustedProxyIssuer::new(["10.0.0.5".parse::<IpAddr>().unwrap()]);
+        let mut req = make_req_from_proxy("203.0.113.10", Some("198.51.100.7"), None);
+        let depot = Depot::new();
+
+        let ip = issuer.issue(&mut req, &depot).await.expect("ip");
+        assert_eq!(ip, "203.0.113.10".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_trusted_proxy_issuer_uses_xff_from_trusted_remote() {
+        let issuer = TrustedProxyIssuer::new(["10.0.0.5".parse::<IpAddr>().unwrap()]);
+        let mut req = make_req_from_proxy("10.0.0.5", Some("198.51.100.7, 10.0.0.5"), None);
+        let depot = Depot::new();
+
+        let ip = issuer.issue(&mut req, &depot).await.expect("ip");
+        assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_trusted_proxy_issuer_falls_back_to_remote_when_headers_missing() {
+        let issuer = TrustedProxyIssuer::new(["10.0.0.5".parse::<IpAddr>().unwrap()]);
+        let mut req = make_req_from_proxy("10.0.0.5", None, None);
+        let depot = Depot::new();
+
+        let ip = issuer.issue(&mut req, &depot).await.expect("ip");
+        assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_trusted_proxy_issuer_uses_x_real_ip_from_trusted_remote() {
+        let issuer = TrustedProxyIssuer::new(["10.0.0.5".parse::<IpAddr>().unwrap()]);
+        let mut req = make_req_from_proxy("10.0.0.5", None, Some("203.0.113.42"));
+        let depot = Depot::new();
+
+        let ip = issuer.issue(&mut req, &depot).await.expect("ip");
+        assert_eq!(ip, "203.0.113.42".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_trusted_proxy_issuer_ignores_spoofed_leftmost_xff() {
+        // A client spoofs `X-Forwarded-For: 1.2.3.4` before reaching the trusted
+        // proxy, which appends the real peer address. The issuer must return the
+        // real client (rightmost non-trusted), not the spoofed leftmost value.
+        let issuer = TrustedProxyIssuer::new(["10.0.0.5".parse::<IpAddr>().unwrap()]);
+        let mut req = make_req_from_proxy("10.0.0.5", Some("1.2.3.4, 198.51.100.7"), None);
+        let depot = Depot::new();
+
+        let ip = issuer.issue(&mut req, &depot).await.expect("ip");
+        assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_trusted_proxy_issuer_skips_chained_trusted_proxies() {
+        // Two trusted proxies in the chain: both must be skipped right-to-left.
+        let issuer = TrustedProxyIssuer::new([
+            "10.0.0.5".parse::<IpAddr>().unwrap(),
+            "10.0.0.6".parse::<IpAddr>().unwrap(),
+        ]);
+        let mut req =
+            make_req_from_proxy("10.0.0.6", Some("198.51.100.7, 10.0.0.5, 10.0.0.6"), None);
+        let depot = Depot::new();
+
+        let ip = issuer.issue(&mut req, &depot).await.expect("ip");
+        assert_eq!(ip, "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_trusted_proxy_issuer_empty_proxies_never_trusts_forwarded_headers() {
+        let issuer = TrustedProxyIssuer::new(std::iter::empty::<IpAddr>());
+        let probe: IpAddr = "10.0.0.5".parse().unwrap();
+        assert!(!issuer.is_trusted(&probe));
     }
 }

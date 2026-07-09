@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::auth::auth_user;
 use crate::db::DbPool;
 use crate::models::posts::Post;
-use crate::models::users::{NewUser, ResUserBody, User, UserCreate, UserCredentiel, UserUpdate};
+use crate::models::users::{NewUser, ResUserBody, User, UserCreate, UserCredentials, UserUpdate};
 use crate::models::{JwtClaims, ResErrorBody, ResTokenBody};
 use crate::schema::*;
 use crate::utils::{SECRET_KEY, hash_password, verify_password};
@@ -26,7 +26,7 @@ fn get_all_users(res: &mut Response, authentication: HeaderParam<String, true>, 
     println!("🪪 Authentication header: {}", authentication.as_str());
 
     // ✅ Get DB connection
-    let pool = depot.obtain::<Arc<DbPool>>().unwrap();
+    let pool = depot.get_typed::<Arc<DbPool>>().unwrap();
     let mut conn = pool.get().expect("❌ Failed to get DB connection");
 
     let current_user = depot.get::<User>("user").unwrap();
@@ -42,7 +42,7 @@ fn get_all_users(res: &mut Response, authentication: HeaderParam<String, true>, 
         .map(|user| ResUserBody {
             id: user.id,
             email: user.username.clone(),
-            full_name: user.username.clone(),
+            full_name: user.full_name.clone(),
             created_at: user.created_at,
             updated_at: user.updated_at,
         })
@@ -58,7 +58,7 @@ fn get_all_users(res: &mut Response, authentication: HeaderParam<String, true>, 
 )]
 fn create_users(res: &mut Response, depot: &mut Depot, user_create: JsonBody<UserCreate>) {
     // ✅ Get DB connection
-    let pool = depot.obtain::<Arc<DbPool>>().unwrap();
+    let pool = depot.get_typed::<Arc<DbPool>>().unwrap();
     let mut conn = pool.get().expect("❌ Failed to get DB connection");
 
     println!("📥 Create new user ...");
@@ -97,7 +97,7 @@ fn create_users(res: &mut Response, depot: &mut Depot, user_create: JsonBody<Use
         id: Uuid::new_v4(),
         username: user_create.email.clone(),
         password: hashed,
-        full_name: user_create.fullname.clone(),
+        full_name: user_create.full_name.clone(),
         created_at: now,
         updated_at: now,
     };
@@ -129,7 +129,7 @@ pub async fn get_users_information(
     println!("🪪 Authentication header: {}", authentication.as_str());
 
     // ✅ Get DB connection
-    let pool = depot.obtain::<Arc<DbPool>>().unwrap();
+    let pool = depot.get_typed::<Arc<DbPool>>().unwrap();
     let mut _conn = pool.get().expect("❌ Failed to get DB connection");
 
     println!("📥 Fetching user information...");
@@ -168,7 +168,7 @@ fn update_users(
 
     let user_uuid = user_id.into_inner();
 
-    let pool = depot.obtain::<Arc<DbPool>>().unwrap();
+    let pool = depot.get_typed::<Arc<DbPool>>().unwrap();
     let mut conn = pool.get().expect("Failed to get DB connection");
 
     let current_user = depot.get::<User>("user").unwrap();
@@ -187,7 +187,7 @@ fn update_users(
 
     let result = diesel::update(users::table.find(user_uuid))
         .set((
-            users::full_name.eq(&update_data.fullname),
+            users::full_name.eq(&update_data.full_name),
             users::updated_at.eq(&Utc::now().naive_utc()),
         ))
         .execute(&mut conn);
@@ -205,7 +205,7 @@ fn update_users(
                 res.render(Json(ResUserBody {
                     id: current_user.id,
                     email: current_user.username.clone(),
-                    full_name: update_data.fullname.clone(),
+                    full_name: update_data.full_name.clone(),
                     created_at: current_user.created_at,
                     updated_at: current_user.updated_at,
                 }));
@@ -235,7 +235,7 @@ fn delete_users(
 ) {
     println!("🪪 Authentication header: {}", authentication.as_str());
 
-    let pool = depot.obtain::<Arc<DbPool>>().unwrap();
+    let pool = depot.get_typed::<Arc<DbPool>>().unwrap();
     let mut conn = pool.get().expect("Failed to get DB connection");
 
     let current_user = depot.get::<User>("user").unwrap();
@@ -294,7 +294,7 @@ fn get_posts_by_users(
 ) {
     println!("🪪 Authentication header: {}", authentication.as_str());
 
-    let pool = depot.obtain::<Arc<DbPool>>().unwrap();
+    let pool = depot.get_typed::<Arc<DbPool>>().unwrap();
     let mut conn = pool.get().expect("Failed to get DB connection");
 
     let current_user = depot.get::<User>("user").unwrap();
@@ -330,15 +330,15 @@ fn get_posts_by_users(
 )]
 fn get_access_token(
     res: &mut Response,
-    user_credentiel: JsonBody<UserCredentiel>,
+    user_credentials: JsonBody<UserCredentials>,
     depot: &mut Depot,
 ) {
-    let pool = depot.obtain::<Arc<DbPool>>().unwrap();
+    let pool = depot.get_typed::<Arc<DbPool>>().unwrap();
     let mut conn = pool.get().expect("Failed to get DB connection");
 
     // ✅ Query user by ID
     let existing_user = users::table
-        .filter(users::username.eq(&user_credentiel.username))
+        .filter(users::username.eq(&user_credentials.username))
         .first::<User>(&mut conn)
         .optional()
         .expect("❌ Failed to query user");
@@ -354,7 +354,7 @@ fn get_access_token(
     };
 
     if !verify_password(
-        user_credentiel.password.clone().as_str(),
+        user_credentials.password.clone().as_str(),
         user.password.clone().as_str(),
     ) {
         println!("bad password");

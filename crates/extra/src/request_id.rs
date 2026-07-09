@@ -25,30 +25,35 @@ use ulid::Ulid;
 use salvo_core::http::{HeaderValue, Request, Response, header::HeaderName};
 use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
 
-/// Key for incoming flash messages in depot.
+/// Key used to store the request id in the depot.
 pub const REQUEST_ID_KEY: &str = "::salvo::request_id";
 
-/// Extension for Depot.
+/// Extension trait that exposes the current request id stored on the [`Depot`].
 pub trait RequestIdDepotExt {
-    /// Get request id reference from depot.
-    fn csrf_token(&self) -> Option<&str>;
+    /// Get a reference to the request id from the depot, if one has been set.
+    fn request_id(&self) -> Option<&str>;
 }
 
 impl RequestIdDepotExt for Depot {
     #[inline]
-    fn csrf_token(&self) -> Option<&str> {
+    fn request_id(&self) -> Option<&str> {
         self.get::<String>(REQUEST_ID_KEY).map(|v| &**v).ok()
     }
 }
 
-/// A middleware for generate request id.
+/// Middleware that assigns a request id to every incoming request.
 #[non_exhaustive]
 pub struct RequestId {
-    /// The header name for request id.
+    /// The header name used to carry the request id.
     pub header_name: HeaderName,
-    /// Whether overwrite exists request id. Default is `true`
+    /// Whether to overwrite an existing request id. Default is `true`.
+    ///
+    /// When set to `false`, a client-supplied id in the request header is trusted
+    /// and propagated to logs, the response and the depot. Only disable this
+    /// behind a trusted proxy that sets/sanitizes the header, otherwise a client
+    /// can inject arbitrary ids (log forging / trace-correlation confusion).
     pub overwrite: bool,
-    /// The generator for request id.
+    /// The generator used to produce request ids.
     pub generator: Box<dyn IdGenerator + Send + Sync>,
 }
 
@@ -62,7 +67,7 @@ impl Debug for RequestId {
 }
 
 impl RequestId {
-    /// Create new `CatchPanic` middleware.
+    /// Create a new `RequestId` middleware.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -72,21 +77,27 @@ impl RequestId {
         }
     }
 
-    /// Set the header name for request id.
+    /// Set the header name used to carry the request id.
     #[must_use]
     pub fn header_name(mut self, name: HeaderName) -> Self {
         self.header_name = name;
         self
     }
 
-    /// Set whether overwrite exists request id. Default is `true`.
+    /// Set whether to overwrite an existing request id. Default is `true`.
+    ///
+    /// # Security
+    ///
+    /// With `false`, a client-supplied id is trusted and forwarded to logs, the
+    /// response and the depot. Only disable overwriting when a trusted proxy
+    /// sets/sanitizes the header; otherwise clients can inject arbitrary ids.
     #[must_use]
     pub fn overwrite(mut self, overwrite: bool) -> Self {
         self.overwrite = overwrite;
         self
     }
 
-    /// Set the generator for request id.
+    /// Set the generator used to produce request ids.
     #[must_use]
     pub fn generator(mut self, generator: impl IdGenerator + Send + Sync + 'static) -> Self {
         self.generator = Box::new(generator);
@@ -116,7 +127,7 @@ impl Default for RequestId {
     }
 }
 
-/// A trait for generate request id.
+/// Trait for types that can generate a new request id.
 pub trait IdGenerator {
     /// Generate a new request id.
     fn generate(&self, req: &mut Request, depot: &mut Depot) -> String;
@@ -131,11 +142,11 @@ where
     }
 }
 
-/// A generator for generate request id with ulid.
+/// An [`IdGenerator`] that produces request ids using ULIDs.
 #[derive(Default, Debug)]
 pub struct UlidGenerator {}
 impl UlidGenerator {
-    /// Create new `UlidGenerator`.
+    /// Create a new `UlidGenerator`.
     #[must_use]
     pub fn new() -> Self {
         Self {}
@@ -167,12 +178,21 @@ impl Handler for RequestId {
             }
         };
 
-        let _ = req.add_header(self.header_name.clone(), &request_id, false);
+        // Overwrite (not append) so the request carries exactly the resolved id:
+        // appending left a client-supplied id in place when `overwrite` generated a
+        // new one (downstream `req.header(..)` then read the stale value), and
+        // duplicated the header in the pass-through case.
+        let _ = req.add_header(self.header_name.clone(), &request_id, true);
 
         let span = tracing::info_span!("request", ?request_id);
         res.headers_mut()
             .insert(self.header_name.clone(), request_id.clone());
-        depot.insert(REQUEST_ID_KEY, request_id);
+        // Store the id as a `String` so `RequestIdDepotExt::request_id()`, which
+        // looks it up by the `String` type, can actually retrieve it. Inserting the
+        // raw `HeaderValue` made that accessor always return `None`.
+        if let Ok(id) = request_id.to_str() {
+            depot.insert(REQUEST_ID_KEY, id.to_owned());
+        }
 
         async move {
             ctrl.call_next(req, depot, res).await;
@@ -267,8 +287,12 @@ mod tests {
         let handler = RequestId::new();
         #[handler]
         async fn depot_checker(depot: &mut Depot, res: &mut Response) {
-            let id = depot.get::<HeaderValue>(REQUEST_ID_KEY).unwrap().clone();
-            res.render(Text::Plain(id.to_str().unwrap().to_owned()));
+            // Exercise the public accessor, which reads the id back as a `String`.
+            let id = depot
+                .request_id()
+                .expect("request id should be retrievable via RequestIdDepotExt")
+                .to_owned();
+            res.render(Text::Plain(id));
         }
         let router = Router::new().hoop(handler).get(depot_checker);
         let service = Service::new(router);

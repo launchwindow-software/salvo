@@ -85,13 +85,16 @@ impl ConstDecoder {
     /// This is the most common method for symmetric key validation.
     #[must_use]
     pub fn from_secret(secret: &[u8]) -> Self {
-        Self::with_validation(DecodingKey::from_secret(secret), Validation::default())
+        Self::with_validation(
+            DecodingKey::from_secret(secret),
+            Validation::new(Algorithm::HS256),
+        )
     }
 
     /// Creates a decoder from a base64-encoded secret string for HMAC verification.
     pub fn from_base64_secret(secret: &str) -> Result<Self, JwtError> {
         DecodingKey::from_base64_secret(secret)
-            .map(|key| Self::with_validation(key, Validation::default()))
+            .map(|key| Self::with_validation(key, Validation::new(Algorithm::HS256)))
     }
 
     /// Creates a decoder from an RSA public key in PEM format.
@@ -105,7 +108,7 @@ impl ConstDecoder {
     /// If you have (n, e) RSA public key components as strings, use this.
     pub fn from_rsa_components(modulus: &str, exponent: &str) -> Result<Self, JwtError> {
         DecodingKey::from_rsa_components(modulus, exponent)
-            .map(|key| Self::with_validation(key, Validation::new(Algorithm::PS512)))
+            .map(|key| Self::with_validation(key, Validation::new(Algorithm::RS256)))
     }
 
     /// If you have (n, e) RSA public key components already decoded, use this.
@@ -113,7 +116,7 @@ impl ConstDecoder {
     pub fn from_rsa_raw_components(modulus: &[u8], exponent: &[u8]) -> Self {
         Self::with_validation(
             DecodingKey::from_rsa_raw_components(modulus, exponent),
-            Validation::new(Algorithm::PS512),
+            Validation::new(Algorithm::RS256),
         )
     }
 
@@ -146,7 +149,7 @@ impl ConstDecoder {
         )
     }
 
-    /// If you know what you're doing and have a RSA EC encoded public key, use this.
+    /// If you know what you're doing and have an EC DER encoded public key, use this.
     #[must_use]
     pub fn from_ec_der(der: &[u8]) -> Self {
         Self::with_validation(
@@ -179,5 +182,26 @@ impl JwtAuthDecoder for ConstDecoder {
         C: for<'de> Deserialize<'de> + Clone,
     {
         decode::<C>(token, &self.decoding_key, &self.validation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rsa_raw_components_default_to_rs256() {
+        let decoder = ConstDecoder::from_rsa_raw_components(&[1, 2, 3], &[1, 0, 1]);
+
+        assert_eq!(decoder.validation.algorithms, [Algorithm::RS256]);
+    }
+
+    #[test]
+    fn secret_constructors_pin_hs256() {
+        let decoder = ConstDecoder::from_secret(b"secret");
+        assert_eq!(decoder.validation.algorithms, [Algorithm::HS256]);
+
+        let decoder = ConstDecoder::from_base64_secret("c2VjcmV0").unwrap();
+        assert_eq!(decoder.validation.algorithms, [Algorithm::HS256]);
     }
 }

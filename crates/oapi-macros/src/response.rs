@@ -325,15 +325,25 @@ impl TryToTokens for ResponseTuple<'_> {
                         PathType::MediaType(path_type) => {
                             let type_tree = path_type.as_type_tree()?;
 
-                            ComponentSchema::new(crate::component::ComponentSchemaProps {
-                                type_tree: &type_tree,
-                                features: Some(vec![Inline::from(path_type.is_inline).into()]),
-                                description: None,
-                                deprecated: None,
-                                object_name: "",
-                                compose_context: None,
-                            })?
-                            .to_token_stream()
+                            if path_type.is_inline {
+                                // User asked to inline the schema body — bypass the
+                                // normal `ComponentSchema` path (which would call
+                                // `to_schema` and return a `$ref`) and emit a
+                                // `ComposeSchema::compose` call instead so the body is
+                                // rendered inline, with generic arguments recursively
+                                // inlined too.
+                                crate::component::build_inline_compose_block(&type_tree, &oapi)
+                            } else {
+                                ComponentSchema::new(crate::component::ComponentSchemaProps {
+                                    type_tree: &type_tree,
+                                    features: Some(vec![Inline::from(path_type.is_inline).into()]),
+                                    description: None,
+                                    deprecated: None,
+                                    object_name: "",
+                                    compose_context: None,
+                                })?
+                                .to_token_stream()
+                            }
                         }
                         PathType::InlineSchema(schema, _) => schema.to_token_stream(),
                     };
@@ -641,8 +651,11 @@ impl Parse for ResponseStatusCode {
                 .and_then(|lit_str| {
                     let value = lit_str.value();
                     if !VALID_STATUS_RANGES.contains(&value.as_str()) {
+                        // Point at the string literal, not call-site: `value` is a
+                        // `String`, and `String::span()` (via `quote`'s `ToTokens`)
+                        // resolves to `Span::call_site()`, mislocating the error.
                         Err(Error::new(
-                            value.span(),
+                            lit_str.span(),
                             format!(
                                 "Invalid status code range, expected one of: {}",
                                 VALID_STATUS_RANGES.join(", "),
@@ -901,15 +914,19 @@ impl TryToTokens for Header {
             // header property with custom type
             let type_tree = header_type.as_type_tree()?;
 
-            let media_type_schema = ComponentSchema::new(crate::component::ComponentSchemaProps {
-                type_tree: &type_tree,
-                features: Some(vec![Inline::from(header_type.is_inline).into()]),
-                description: None,
-                deprecated: None,
-                object_name: "",
-                compose_context: None,
-            })?
-            .to_token_stream();
+            let media_type_schema = if header_type.is_inline {
+                crate::component::build_inline_compose_block(&type_tree, &oapi)
+            } else {
+                ComponentSchema::new(crate::component::ComponentSchemaProps {
+                    type_tree: &type_tree,
+                    features: Some(vec![Inline::from(header_type.is_inline).into()]),
+                    description: None,
+                    deprecated: None,
+                    object_name: "",
+                    compose_context: None,
+                })?
+                .to_token_stream()
+            };
 
             tokens.extend(quote! {
                 #oapi::oapi::Header::new(#media_type_schema)

@@ -5,10 +5,10 @@
 //! ```no_run
 //! use std::fs::create_dir_all;
 //! use std::path::Path;
-//! 
+//!
 //! use salvo_core::prelude::*;
 //! use salvo_extra::size_limiter::max_size;
-//! 
+//!
 //! #[handler]
 //! async fn index(res: &mut Response) {
 //!     res.render(Text::Html(INDEX_HTML));
@@ -30,7 +30,7 @@
 //!         res.render(Text::Plain("file not found in request"));
 //!     }
 //! }
-//! 
+//!
 //! #[tokio::main]
 //! async fn main() {
 //!     create_dir_all("temp").unwrap();
@@ -43,11 +43,11 @@
 //!                 .post(upload),
 //!         )
 //!         .push(Router::with_path("unlimit").post(upload));
-//! 
+//!
 //!     let acceptor = TcpListener::new("0.0.0.0:8698").bind().await;
 //!     Server::new(acceptor).serve(router).await;
 //! }
-//! 
+//!
 //! static INDEX_HTML: &str = r#"<!DOCTYPE html>
 //! <html>
 //!     <head>
@@ -69,38 +69,55 @@
 //! </html>
 //! "#;
 //! ```
-use salvo_core::http::StatusError;
-use salvo_core::http::{Body, Request, Response};
-use salvo_core::{async_trait, Depot, FlowCtrl, Handler};
+use salvo_core::http::{Body, Request, Response, StatusError};
+use salvo_core::{Depot, FlowCtrl, Handler, async_trait};
 
 /// MaxSize limit for request size.
 #[derive(Debug)]
 pub struct MaxSize(pub u64);
 #[async_trait]
 impl Handler for MaxSize {
-    async fn handle(&self, req: &mut Request, depot: &mut Depot, res: &mut Response, ctrl: &mut FlowCtrl) {
-        let size_hint = req.body().size_hint().upper();
-        if let Some(upper) = size_hint {
-            if upper > self.0 {
-                res.render(StatusError::payload_too_large());
-                ctrl.skip_rest();
-            } else {
-                ctrl.call_next(req, depot, res).await;
-            }
-        } else {
-            res.render(StatusError::bad_request().brief("request body size is unknown"));
+    async fn handle(
+        &self,
+        req: &mut Request,
+        depot: &mut Depot,
+        res: &mut Response,
+        ctrl: &mut FlowCtrl,
+    ) {
+        if let Some(upper) = req.body().size_hint().upper()
+            && upper > self.0
+        {
+            res.render(StatusError::payload_too_large());
             ctrl.skip_rest();
+            return;
         }
+
+        let max_size = request_limit(self.0);
+        req.limit_body(max_size);
+        ctrl.call_next(req, depot, res).await;
     }
 }
+
+#[inline]
+fn request_limit(max_size: u64) -> usize {
+    max_size.min(usize::MAX as u64) as usize
+}
+
 /// Create a new `MaxSize`.
 #[inline]
-#[must_use] pub fn max_size(size: u64) -> MaxSize {
+#[must_use]
+pub fn max_size(size: u64) -> MaxSize {
     MaxSize(size)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use salvo_core::BoxedError;
+    use salvo_core::http::ParseError;
+    use salvo_core::http::body::{Frame, ReqBody, SizeHint};
     use salvo_core::prelude::*;
     use salvo_core::test::{ResponseExt, TestClient};
 
@@ -109,6 +126,45 @@ mod tests {
     #[handler]
     async fn hello() -> &'static str {
         "hello"
+    }
+
+    struct UnknownSizeBody {
+        frame: Option<Frame<salvo_core::hyper::body::Bytes>>,
+    }
+
+    impl UnknownSizeBody {
+        fn new(bytes: &'static [u8]) -> Self {
+            Self {
+                frame: Some(Frame::data(salvo_core::hyper::body::Bytes::from_static(
+                    bytes,
+                ))),
+            }
+        }
+    }
+
+    impl Body for UnknownSizeBody {
+        type Data = salvo_core::hyper::body::Bytes;
+        type Error = BoxedError;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Ready(self.frame.take().map(Ok))
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::new()
+        }
+    }
+
+    #[handler]
+    async fn read_payload(req: &mut Request, res: &mut Response) {
+        match req.payload().await {
+            Ok(_) => res.render("ok"),
+            Err(ParseError::PayloadTooLarge) => res.render(StatusError::payload_too_large()),
+            Err(error) => res.render(StatusError::bad_request().brief(error.to_string())),
+        }
     }
 
     #[tokio::test]
@@ -134,5 +190,30 @@ mod tests {
             .await;
         assert_eq!(res.status_code.unwrap(), StatusCode::PAYLOAD_TOO_LARGE);
     }
-}
 
+    #[tokio::test]
+    async fn test_size_limiter_limits_unknown_length_streaming_body() {
+        let limit_handler = MaxSize(4);
+        let router = Router::new()
+            .hoop(limit_handler)
+            .push(Router::with_path("upload").post(read_payload));
+        let service = Service::new(router);
+        let body = ReqBody::Boxed {
+            inner: Box::pin(UnknownSizeBody::new(b"too large")),
+            fuse_config: None,
+        };
+
+        let res = TestClient::post("http://127.0.0.1:5801/upload")
+            .body(body)
+            .send(&service)
+            .await;
+
+        assert_eq!(res.status_code.unwrap(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn test_request_limit_clamps_to_platform_usize() {
+        assert_eq!(request_limit(4), 4);
+        assert_eq!(request_limit(u64::MAX), usize::MAX);
+    }
+}

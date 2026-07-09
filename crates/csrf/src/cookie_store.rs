@@ -1,6 +1,6 @@
 use cookie::time::Duration;
 use cookie::{Cookie, Expiration, SameSite};
-use salvo_core::http::uri::Scheme;
+use salvo_core::http::SecureCookiePolicy;
 use salvo_core::{Depot, Error, Request, Response};
 
 use crate::CsrfCipher;
@@ -19,6 +19,10 @@ pub struct CookieStore {
     pub path: String,
     /// CSRF cookie domain.
     pub domain: Option<String>,
+    /// Forced secure cookie attribute. If None, infer from request URI scheme.
+    pub secure: Option<bool>,
+    /// Policy used when `secure` is not explicitly set.
+    pub secure_cookie_policy: SecureCookiePolicy,
 }
 impl Default for CookieStore {
     #[inline]
@@ -36,6 +40,8 @@ impl CookieStore {
             name: "salvo.csrf".into(),
             path: "/".into(),
             domain: None,
+            secure: None,
+            secure_cookie_policy: SecureCookiePolicy::AutoFromScheme,
         }
     }
     /// Sets cookie name.
@@ -65,6 +71,27 @@ impl CookieStore {
         self.domain = Some(domain.into());
         self
     }
+
+    /// Forces the `Secure` attribute for CSRF cookies.
+    ///
+    /// By default this is detected from the request URI scheme. Use this option in
+    /// production when TLS is terminated before the Salvo application.
+    #[must_use]
+    pub fn secure(mut self, secure: bool) -> Self {
+        self.secure = Some(secure);
+        self.secure_cookie_policy = SecureCookiePolicy::from_bool(secure);
+        self
+    }
+
+    /// Sets the policy used to decide whether CSRF cookies include `Secure`.
+    ///
+    /// This clears the legacy fixed `secure` override so the policy controls future saves.
+    #[must_use]
+    pub fn secure_cookie_policy(mut self, policy: SecureCookiePolicy) -> Self {
+        self.secure = None;
+        self.secure_cookie_policy = policy;
+        self
+    }
 }
 impl CsrfStore for CookieStore {
     type Error = Error;
@@ -92,7 +119,11 @@ impl CsrfStore for CookieStore {
         token: &str,
         proof: &str,
     ) -> Result<(), Self::Error> {
-        let secure = req.uri().scheme() == Some(&Scheme::HTTPS);
+        let secure = self
+            .secure
+            .map(SecureCookiePolicy::from_bool)
+            .unwrap_or(self.secure_cookie_policy)
+            .is_secure(req);
         let expires = cookie::time::OffsetDateTime::now_utc() + self.ttl;
         let cookie_builder = Cookie::build((self.name.clone(), format!("{token}.{proof}")))
             .http_only(true)
@@ -123,14 +154,17 @@ mod tests {
             .name("test_cookie")
             .ttl(Duration::days(1))
             .path("/test")
-            .domain("example.com");
+            .domain("example.com")
+            .secure(true);
 
         assert_eq!(cookie_store.name, "test_cookie");
         assert_eq!(cookie_store.ttl, Duration::days(1));
         assert_eq!(cookie_store.path, "/test");
         assert_eq!(cookie_store.domain.as_deref(), Some("example.com"));
+        assert_eq!(cookie_store.secure, Some(true));
+        assert_eq!(cookie_store.secure_cookie_policy, SecureCookiePolicy::Always);
 
-        let mut req = TestClient::get("https://example.com/test").build();
+        let mut req = TestClient::get("http://example.com/test").build();
         let mut depot = Depot::new();
         let mut res = Response::new();
 
@@ -152,5 +186,63 @@ mod tests {
 
         let loaded = cookie_store.load(&mut req, &mut depot, &cipher).await;
         assert_eq!(loaded, Some((token, proof)));
+    }
+
+    #[tokio::test]
+    async fn test_cookie_store_infers_secure_from_https_scheme() {
+        let cipher = BcryptCipher::new();
+        let cookie_store = CookieStore::new().name("test_cookie");
+        let mut req = TestClient::get("https://example.com/test").build();
+        let mut depot = Depot::new();
+        let mut res = Response::new();
+
+        let (token, proof) = cipher.generate();
+        cookie_store
+            .save(&mut req, &mut depot, &mut res, &token, &proof)
+            .await
+            .unwrap();
+
+        let cookie = res.cookies().get("test_cookie").unwrap();
+        assert_eq!(cookie.secure(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_cookie_store_secure_policy_can_force_secure() {
+        let cipher = BcryptCipher::new();
+        let cookie_store = CookieStore::new()
+            .name("test_cookie")
+            .secure_cookie_policy(SecureCookiePolicy::Always);
+        let mut req = TestClient::get("http://example.com/test").build();
+        let mut depot = Depot::new();
+        let mut res = Response::new();
+
+        let (token, proof) = cipher.generate();
+        cookie_store
+            .save(&mut req, &mut depot, &mut res, &token, &proof)
+            .await
+            .unwrap();
+
+        let cookie = res.cookies().get("test_cookie").unwrap();
+        assert_eq!(cookie.secure(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_cookie_store_secure_policy_can_disable_https_secure() {
+        let cipher = BcryptCipher::new();
+        let cookie_store = CookieStore::new()
+            .name("test_cookie")
+            .secure_cookie_policy(SecureCookiePolicy::Never);
+        let mut req = TestClient::get("https://example.com/test").build();
+        let mut depot = Depot::new();
+        let mut res = Response::new();
+
+        let (token, proof) = cipher.generate();
+        cookie_store
+            .save(&mut req, &mut depot, &mut res, &token, &proof)
+            .await
+            .unwrap();
+
+        let cookie = res.cookies().get("test_cookie").unwrap();
+        assert_eq!(cookie.secure(), Some(false));
     }
 }

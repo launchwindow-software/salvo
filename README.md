@@ -24,7 +24,7 @@
 <a href="https://docs.rs/salvo"><img alt="Documentation" src="https://docs.rs/salvo/badge.svg" /></a>
 <a href="https://crates.io/crates/salvo"><img alt="Download" src="https://img.shields.io/crates/d/salvo.svg" /></a>
 <a href="https://github.com/rust-secure-code/safety-dance/"><img alt="unsafe forbidden" src="https://img.shields.io/badge/unsafe-forbidden-success.svg" /></a>
-<a href="https://blog.rust-lang.org/2025/12/11/Rust-1.92.0/"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.92%2B-blue" /></a>
+<a href="https://blog.rust-lang.org/2026/03/05/Rust-1.94.0/"><img alt="Rust Version" src="https://img.shields.io/badge/rust-1.94%2B-blue" /></a>
 <br>
 <a href="https://salvo.rs">
     <img alt="Website" src="https://img.shields.io/badge/https-salvo.rs-%23f00" />
@@ -48,6 +48,7 @@
 ## Quick Start
 
 Create a new project:
+
 ```bash
 cargo new hello-salvo
 cd hello-salvo
@@ -72,6 +73,7 @@ async fn main() {
 ```
 
 Run it:
+
 ```bash
 cargo run
 ```
@@ -101,6 +103,42 @@ Router::new()
     .push(Router::with_path("articles").get(list_articles))
     // Protected routes
     .push(Router::with_path("articles").hoop(auth_check).post(create_article).delete(delete_article))
+```
+
+### JSON APIs
+
+Salvo handlers can deserialize request bodies and return typed JSON responses:
+
+```rust
+use salvo::http::ParseError;
+use salvo::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct CreateTodo {
+    text: String,
+}
+
+#[derive(Serialize)]
+struct Todo {
+    id: u64,
+    text: String,
+}
+
+#[handler]
+async fn create_todo(req: &mut Request) -> Result<Json<Todo>, ParseError> {
+    let payload = req.parse_json::<CreateTodo>().await?;
+    Ok(Json(Todo {
+        id: 1,
+        text: payload.text,
+    }))
+}
+```
+
+For this pattern, add Serde's derive feature:
+
+```bash
+cargo add serde --features derive
 ```
 
 ### OpenAPI in One Line
@@ -138,6 +176,7 @@ salvo new my_project
 - [Official Website](https://salvo.rs)
 - [API Documentation](https://docs.rs/salvo)
 - [Examples](./examples/)
+- [Feature-specific crates](./crates/)
 
 ## Recommended Projects
 
